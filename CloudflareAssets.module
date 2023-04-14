@@ -1,1 +1,591 @@
+<?php namespace ProcessWire;
 
+/**
+ * Cloudflare Assets
+ *
+ * #pw-summary Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.
+ *
+ * @copyright 2023 NB Communication Ltd
+ * @license Mozilla Public License v2.0 http://mozilla.org/MPL/2.0/
+ *
+ * @property string $accountId
+ * @property string $accessToken
+ * @property string $bucket
+ * @property string $accessKeyId
+ * @property string $secretAccessKey
+ * @property string $customerSubdomain
+ * @property string $allowedOriginsList
+ * @property string $accountHash
+ *
+ * @property array $allowedOrigins
+ * @property S3Client $s3
+ *
+ * @todo Implementation of additional Pageimage options
+ *
+ */
+
+class CloudflareAssets extends WireData implements Module, ConfigurableModule {
+
+	/**
+	 * getModuleInfo is a module required by all modules to tell ProcessWire about them
+	 *
+	 * @return array
+	 *
+	 */
+	public static function getModuleInfo() {
+		return [
+			'title' => 'Cloudflare Assets',
+			'version' => 001,
+			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
+			'author' => 'nbcommunication',
+			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
+			'singular' => true,
+			'autoload' => true,
+			'icon' => 'cloud',
+			'requires' => 'ProcessWire>=3.0.210,PHP>=8.1.0',
+		];
+	}
+
+	const formDataBoundary = '---011000010111000001101001';
+	const streamExtensions = 'mp4 mkv mov avi flv webm mpg';
+
+	/**
+	 * An array of allowed origins for Streams
+	 *
+	 * @var array
+	 *
+	 */
+	protected $allowedOrigins = [];
+
+	/**
+	 * The AWS S3 client
+	 *
+	 * @var S3Client
+	 *
+	 */
+	protected $s3 = null;
+
+	/**
+	 * Initialize the module
+	 *
+	 */
+	public function init() {
+
+		if($this->bucket && $this->accessKeyId && $this->secretAccessKey) {
+
+			require_once __DIR__ . '/vendor/autoload.php';
+
+			try {
+
+				$this->s3 = new \Aws\S3\S3Client([
+					'region' => 'auto',
+					'endpoint' => "https://{$this->accountId}.r2.cloudflarestorage.com",
+					'version' => 'latest',
+					'credentials' => new \Aws\Credentials\Credentials($this->accessKeyId, $this->secretAccessKey),
+				]);
+
+				$this->s3->registerStreamWrapperV2();
+
+				if(!$this->s3->doesBucketExistV2($this->bucket)) {
+					$this->s3->createBucket([
+						'Bucket' => $this->bucket,
+					]);
+				}
+
+			} catch(\Aws\S3\Exception\S3Exception $e) {
+
+				$this->log($e->getMessage());
+
+			} catch(\Aws\Exception\AwsException $e) {
+
+				$this->log($e->getMessage());
+			}
+		}
+
+		$this->allowedOriginsList = trim($this->allowedOriginsList);
+		if($this->allowedOriginsList) {
+			$this->allowedOrigins = array_map(function($line) {
+				return trim($line);
+			}, explode("\n", $this->allowedOriginsList));
+		}
+	}
+
+	/**
+	 * When ProcessWire is ready
+	 *
+	 */
+	public function ready() {
+
+		// If authenticated, attach hooks
+		if($this->s3 && $this->accountId && $this->accessToken && $this->wire()->cache->getFor(
+			$this,
+			md5($this->accountId . $this->accessToken),
+			WireCache::expireNever,
+			function() {
+				return $this->apiRequest()['result']['status'] ?? '' === 'active';
+			}
+		)) {
+
+			$this->addHook('Pagefile::url()', $this, 'hookPagefileUrl');
+			$this->addHook('Pagefile::httpUrl()', $this, 'hookPagefileHttpUrl');
+			$this->addHookProperty('Pagefile::s3', $this, 'hookPagefileS3');
+
+			$this->addHookAfter('PagefilesManager::save', $this, 'hookPagefilesManagerSave');
+
+			$this->addHookBefore('InputfieldFile::render', $this, 'hookInputfieldFileRender');
+
+			$this->addHookAfter('Pagefiles::delete', $this, 'hookPagefilesDelete');
+
+			$this->addHook('Pageimage::size()', $this, 'hookPageimageSize');
+		}
+	}
+
+	/**
+	 * Hook Pagefile::url()
+	 *
+	 * @param HookEvent $event
+	 * @return string
+	 *
+	 */
+	public function hookPagefileUrl(HookEvent $event) {
+
+		$pagefile = $event->object;
+		$uid = $this->uid($pagefile);
+
+		if($uid) {
+
+			$url = $this->domain;
+			if(strpos($url, '://') === false) {
+				$url = "https://$url";
+			}
+
+			if($this->useImages($pagefile)) {
+
+				$url .= "/cdn-cgi/imagedelivery/{$this->accountHash}/$uid/" . (
+					isset($pagefile->cfImage) && is_array($pagefile->cfImage) ?
+						http_build_query($pagefile->cfImage, '', ',') :
+						'public'
+				);
+
+				//https://example.com/cdn-cgi/imagedelivery/
+
+			} else if($this->useStream($pagefile)) {
+
+				$url = "https://{$this->customerSubdomain}/$uid/iframe";
+
+			} else {
+
+				$url .= "/$uid";
+
+				/*$url = $this->wire()->cache->getFor($this, $uid, 3600, function() use ($uid) {
+
+					// The second parameter allows you to determine how long the presigned link is valid.
+					$request = $this->s3->createPresignedRequest(
+						$this->s3->getCommand('GetObject', [
+							'Bucket' => $this->bucket,
+							'Key' => $uid,
+						]),
+						'+1 hour' // figure out how to work this with caching
+					);
+
+					return (string) $request->getUri();
+				});*/
+			}
+
+			$event->replace = true;
+			$event->return = $url;
+		}
+	}
+
+	/**
+	 * Hook Pagefile::httpUrl()
+	 *
+	 * @param HookEvent $event
+	 * @return string
+	 *
+	 */
+	public function hookPagefileHttpUrl(HookEvent $event) {
+		$pagefile = $event->object;
+		$uid = $this->uid($pagefile);
+		if($uid) {
+			$event->replace = true;
+			$event->return = $event->object->url();
+		}
+	}
+
+	/**
+	 * Hook Pagefile::s3
+	 *
+	 * Return the s3 'Key' for this Pagefile
+	 *
+	 * @param HookEvent $event
+	 * @return string
+	 *
+	 */
+	public function hookPagefileS3(HookEvent $event) {
+		$event->return = "{$event->object->page->id}/{$event->object->basename}";
+	}
+
+	/**
+	 * Hook PagefilesManager::save
+	 *
+	 * After a file is added, add it to the appropriate Cloudflare service
+	 *
+	 * @param HookEvent $event
+	 * @return string
+	 *
+	 */
+	public function hookPagefilesManagerSave(HookEvent $event) {
+
+		$page = $event->object->page;
+		foreach($page as $value) {
+
+			if($value instanceof Pagefiles && $value->count() && $page->isChanged($value->field->name)) {
+
+				foreach($value as $pagefile) {
+
+					$uid = $this->uid($pagefile);
+					if($uid && $this->useStream($pagefile)) {
+
+						// If a video file which already exists
+						// Check if we need to update the name from the description
+
+						$response = $this->apiRequest(
+							"stream/$uid",
+							[],
+							'GET'
+						);
+
+						if($response['success'] ?? false) {
+
+							$label = $this->getLabel($pagefile);
+							if($label !== ($response['result'][0]['meta']['name'] ?? '')) {
+								$this->apiRequest(
+									"stream/$uid",
+									[
+										'meta' => [
+											'name' => $label,
+										],
+										'allowedOrigins' => $this->allowedOrigins,
+									]
+								);
+							}
+
+						} else {
+							// Not found, check the log for details
+						}
+
+					} else {
+
+						// Add to Cloudflare if not already added
+						$this->addToCloudflare($pagefile);
+					}
+				}
+			}
+		}
+	}
+
+	/**
+	 * Hook InputfieldFile::render
+	 *
+	 * @param HookEvent $event
+	 * @return string
+	 *
+	 */
+	public function hookInputfieldFileRender(HookEvent $event) {
+
+		if($event->object->value instanceof Pagefiles && $event->object->value->count) {
+
+			foreach($event->object->value as $pagefile) {
+
+				$uid = $this->uid($pagefile);
+				if($uid) {
+					// If the file does not exist, copy it from R2
+					if(!file_exists($pagefile->filename)) {
+						file_put_contents($pagefile->filename, fopen("s3://{$this->bucket}/$pagefile->s3", 'r'));
+					}
+				} else {
+					// If the file already stored in Cloudflare, store it
+					$this->addToCloudflare($pagefile);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Hook Pagefiles::delete
+	 *
+	 * When a file is deleted, remove it from Cloudflare
+	 *
+	 * @param HookEvent $event
+	 * @return string
+	 *
+	 */
+	public function hookPagefilesDelete(HookEvent $event) {
+
+		$pagefile = $event->arguments(0);
+		$uid = $this->uid($pagefile);
+
+		if($uid) {
+
+			$endpoint = $this->useImages($pagefile) ? 'images/v1' : ($this->useStream($pagefile) ? 'stream' : '');
+			if($endpoint) {
+				$response = $this->apiRequest(
+					"$endpoint/$uid",
+					[],
+					'DELETE'
+				);
+			}
+
+			if(unlink("s3://{$this->bucket}/$pagefile->s3")) {
+				$this->wire()->cache->deleteFor($this, $pagefile->s3);
+			}
+		}
+	}
+
+	/**
+	 * Hook Pageimage::size()
+	 *
+	 * @param HookEvent $event
+	 * @return string
+	 * @see https://developers.cloudflare.com/images/cloudflare-images/transform/flexible-variants/
+	 *
+	 */
+	public function hookPageimageSize(HookEvent $event) {
+
+		$pageimage = $event->object;
+
+		$width = $event->arguments(0);
+		$height = $event->arguments(1);
+		$options = $event->arguments(2);
+
+		if($pageimage->ext !== 'svg') {
+
+			if(!is_array($options)) $options = $pageimage->sizeOptionsToArray($options);
+
+			$cfImage = [
+				'fit' => 'crop',
+				'format' => 'auto',
+				'height' => $height,
+				'width' => $width,
+			];
+
+			$focus = $pageimage->focus();
+			if($focus) {
+				$cfImage['gravity'] = ((float) $focus['left'] / 100) . 'x' . ((float) $focus['top'] / 100);
+			}
+
+			foreach([
+				'anim',
+				'background',
+				'blur',
+				'border',
+				'brightness',
+				'contrast',
+				'dpr',
+				'fit',
+				'format',
+				'gamma',
+				'gravity',
+				'height',
+				'metadata',
+				'quality', // automatically mapped
+				'rotate', // automatically mapped
+				'sharpen',
+				'trim',
+				'width',
+			] as $key) {
+				if(isset($options[$key])) {
+					$cfImage[$key] = $options[$key];
+				}
+			}
+
+			foreach([
+				'upscaling' => 'fit',
+				'cropping' => 'gravity',
+				'sharpening' => 'sharpen',
+			] as $pwKey => $cfKey) {
+				if(isset($options[$pwKey])) {
+					$value = $options[$pwKey];
+					switch($pwKey) {
+						case 'upscaling':
+							// todo change 'fit' to cover?
+							break;
+						case 'cropping':
+							// todo convert to gravity
+							break;
+						case 'sharpening':
+							$value = [
+								'none' => 0,
+								'soft' => 1,
+								'medium' => 5,
+								'strong' => 10,
+							][$value];
+							break;
+					}
+					$cfImage[$cfKey] = $value;
+				}
+			}
+
+			$pageimage->set('cfImage', $cfImage);
+		}
+
+		$event->return = $pageimage;
+	}
+
+	/**
+	 * Add the file to Cloudflare
+	 *
+	 * @param Pagefile $pagefile
+	 * @return string|null
+	 *
+	 */
+	public function addToCloudflare(Pagefile $pagefile) {
+
+		$uid = $this->uid($pagefile);
+
+		if(!$uid) {
+
+			$r2Only = false;
+			if($this->useImages($pagefile)) {
+
+				$boundary = '--' . self::formDataBoundary;
+				$response = $this->apiRequest(
+					'images/v1',
+					"$boundary\r\n" .
+					"Content-Disposition: form-data; name=\"url\"\r\n\r\n$pagefile->httpUrl\r\n" .
+					"$boundary--\r\n\r\n"
+				);
+
+				$uid = $response['result']['id'] ?? null;
+
+			} else if($this->useStream($pagefile)) {
+
+				$response = $this->apiRequest(
+					'stream/copy',
+					[
+						'url' => $pagefile->httpUrl,
+						'meta' => [
+							'name' => $this->getLabel($pagefile),
+						],
+						'allowedOrigins' => $this->allowedOrigins,
+					]
+				);
+
+				$uid = $response['result']['uid'] ?? null;
+
+			} else {
+
+				$r2Only = true;
+			}
+
+			// All files are placed in R2 via s3
+			// But we only need to set the uid if the file is only in the r2 bucket
+			if(file_put_contents("s3://{$this->bucket}/$pagefile->s3", fopen($pagefile->filename, 'r')) && $r2Only) {
+				$uid = $pagefile->s3;
+			}
+
+			if(isset($uid)) {
+				$this->uid($pagefile, $uid);
+			}
+		}
+
+		return $uid;
+	}
+
+	/**
+	 * Get the name (label) of this
+	 *
+	 * @param Pagefile $pagefile
+	 * @return string
+	 *
+	 */
+	public function ___getLabel(Pagefile $pagefile) {
+		return $this->wire()->sanitizer->truncate($pagefile->description ?: $pagefile->page->title ?: $pagefile->basename, 1024);
+	}
+
+	/**
+	 * Send to the Cloudflare API
+	 *
+	 * @param string $endpoint
+	 * @param array|string $data
+	 * @param string $method
+	 * @return array
+	 *
+	 */
+	protected function apiRequest($endpoint = '', $data = [], $method = 'POST') {
+
+		$http = $this->wire(new WireHttp());
+
+		if($endpoint) {
+			$endpoint = "accounts/{$this->accountId}/$endpoint";
+		} else {
+			$endpoint = 'user/tokens/verify';
+			$method = 'GET';
+		}
+
+		$contentType = 'application/json';
+		if(!is_array($data)) {
+			$contentType = 'multipart/form-data; boundary=' . self::formDataBoundary;
+		} else if(count($data)) {
+			$data = json_encode($data);
+		}
+
+		$response = $http
+			->setTimeout(20)
+			->setHeaders([
+				'Authorization' => "Bearer {$this->accessToken}",
+				'Content-Type' => $contentType,
+			])
+			->send(
+				"https://api.cloudflare.com/client/v4/$endpoint",
+				$data,
+				$method,
+				['use' => 'curl']
+			);
+
+		$response = $response ? (json_decode($response, 1) ?? [$response]) : [];
+		if(!($response['success'] ?? false)) {
+			$this->log(json_encode($response));
+		}
+
+		return $response;
+	}
+
+	/**
+	 * Get/set the UID in filedata
+	 *
+	 * @param Pagefile $pagefile
+	 * @param mixed $value
+	 * @return mixed
+	 * @see Pagefile::filedata()
+	 *
+	 */
+	protected function uid(Pagefile $pagefile, $value = null) {
+		return $pagefile->filedata($this->className, $value);
+	}
+
+	/**
+	 * Should Cloudflare Images be used for the Pagefile?
+	 *
+	 * @param Pagefile $pagefile
+	 * @return bool
+	 *
+	 */
+	protected function useImages(Pagefile $pagefile) {
+		return $this->accountHash && $pagefile instanceof Pageimage;
+	}
+
+	/**
+	 * Should Cloudflare Stream be used for the Pagefile?
+	 *
+	 * @param Pagefile $pagefile
+	 * @return bool
+	 *
+	 */
+	protected function useStream(Pagefile $pagefile) {
+		return $this->customerSubdomain &&
+			!$this->useImages($pagefile) &&
+			in_array($pagefile->ext, explode(' ', self::streamExtensions));
+	}
+}
