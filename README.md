@@ -17,10 +17,10 @@ As ProcessWire's admin still requires the file to be available locally, in a mul
 **ProcessWire >= 3.0.210 and PHP >= 8.1.0 are required to use this module.**
 
 ## Configuration
-To configure this module, go to Modules > Configure > CloudflareAssets.
+To configure this module, go to Modules > Configure > CloudflareAssets. In another tab, open your [Cloudflare dashboard](https://dash.cloudflare.com).
 
-These settings are used for more than one service:
-- **Account ID**: You should find this at the top of right sidebar on any of the main screens for R2 / Stream / Images
+The following settings are used for more than one service:
+- **Account ID**: You should find this at the top of right sidebar on any of the main screens for R2 / Stream / Images.
 - **Access Token**: This is used for API access for Stream and Images. See *Creating an API Token* below.
 - **Custom domain**: This must be a domain managed and served by Cloudflare. See *Creating a custom domain* below.
 
@@ -37,6 +37,13 @@ To create an API token:
 
 ### Creating a custom domain
 Coming soon: These instructions will be written in the near future (May 2023).
+
+#### Connecting your custom domain
+Your custom domain needs to be manually connected to your bucket.
+- In your bucket dashboard go to Settings > Public access > Custom Domains.
+- Click *Connect Domain*.
+- Add the domain you wish to connect and click *Continue*.
+- Allow Cloudflare to add the CNAME record by clicking *Connect domain*.
 
 ### R2
 This information can be found in the R2 area of your Cloudflare account:

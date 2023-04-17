@@ -35,7 +35,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'Cloudflare Assets',
-			'version' => 001,
+			'version' => 002,
 			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
@@ -71,7 +71,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 */
 	public function init() {
 
-		if($this->bucket && $this->accessKeyId && $this->secretAccessKey) {
+		if($this->accountId && $this->bucket && $this->accessKeyId && $this->secretAccessKey) {
 
 			require_once __DIR__ . '/vendor/autoload.php';
 
@@ -116,27 +116,37 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 */
 	public function ready() {
 
-		// If authenticated, attach hooks
-		if($this->s3 && $this->accountId && $this->accessToken && $this->wire()->cache->getFor(
-			$this,
-			md5($this->accountId . $this->accessToken),
-			WireCache::expireNever,
-			function() {
-				return $this->apiRequest()['result']['status'] ?? '' === 'active';
+		if($this->s3 && $this->accessToken) {
+
+			$cacheKey = md5($this->accountId . $this->accessToken);
+			$tokenVerified = $this->wire()->cache->getFor($this, $cacheKey);
+			if(!$tokenVerified) {
+				$response = $this->apiRequest();
+				if($response['result']['status'] ?? '' === 'active') {
+					$tokenVerified = true;
+					$this->wire()->cache->saveFor($this, $cacheKey, 1, WireCache::expireNever);
+				} else {
+					// Remove access token
+					$this->log($this->_('Sorry, the Account ID / Access Token you provided is invalid.'));
+					$this->wire()->modules->saveConfig($this, 'accountId', '');
+					$this->wire()->modules->saveConfig($this, 'accessToken', '');
+				}
 			}
-		)) {
 
-			$this->addHook('Pagefile::url()', $this, 'hookPagefileUrl');
-			$this->addHook('Pagefile::httpUrl()', $this, 'hookPagefileHttpUrl');
-			$this->addHookProperty('Pagefile::s3', $this, 'hookPagefileS3');
+			// If authenticated, attach hooks
+			if($tokenVerified) {
+				$this->addHook('Pagefile::url()', $this, 'hookPagefileUrl');
+				$this->addHook('Pagefile::httpUrl()', $this, 'hookPagefileHttpUrl');
+				$this->addHookProperty('Pagefile::s3', $this, 'hookPagefileS3');
 
-			$this->addHookAfter('PagefilesManager::save', $this, 'hookPagefilesManagerSave');
+				$this->addHookAfter('PagefilesManager::save', $this, 'hookPagefilesManagerSave');
 
-			$this->addHookBefore('InputfieldFile::render', $this, 'hookInputfieldFileRender');
+				$this->addHookBefore('InputfieldFile::render', $this, 'hookInputfieldFileRender');
 
-			$this->addHookAfter('Pagefiles::delete', $this, 'hookPagefilesDelete');
+				$this->addHookAfter('Pagefiles::delete', $this, 'hookPagefilesDelete');
 
-			$this->addHook('Pageimage::size()', $this, 'hookPageimageSize');
+				$this->addHook('Pageimage::size()', $this, 'hookPageimageSize');
+			}
 		}
 	}
 
@@ -161,7 +171,8 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 			if($this->useImages($pagefile)) {
 
-				$url .= "/cdn-cgi/imagedelivery/{$this->accountHash}/$uid/" . (
+				$url .= "/cdn-cgi/imagedelivery/{$this->accountHash}/$uid/" . //($pagefile->cfVariant ?? 'public')
+				(
 					isset($pagefile->cfImage) && is_array($pagefile->cfImage) ?
 						http_build_query($pagefile->cfImage, '', ',') :
 						'public'
@@ -359,13 +370,13 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		$height = $event->arguments(1);
 		$options = $event->arguments(2);
 
-		if($pageimage->ext !== 'svg') {
+		if($pageimage->ext !== 'svg' && $this->useImages($pageimage)) {
 
 			if(!is_array($options)) $options = $pageimage->sizeOptionsToArray($options);
 
 			$cfImage = [
 				'fit' => 'crop',
-				'format' => 'auto',
+				'format' => 'auto', // todo remove for named variants
 				'height' => $height,
 				'width' => $width,
 			];
@@ -384,7 +395,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				'contrast',
 				'dpr',
 				'fit',
-				'format',
+				'format', // todo remove for named variants
 				'gamma',
 				'gravity',
 				'height',
@@ -426,6 +437,59 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 					$cfImage[$cfKey] = $value;
 				}
 			}
+
+			/*
+
+			named variants
+
+			$files = $this->wire()->files;
+
+			$cfVariant = $this->wire()->sanitizer->alphanumeric(http_build_query($cfImage, '', 'I'));
+
+			$cacheName = "{$this->wire()->config->paths->cache}{$this->className}.cache";
+			$cacheDelimiter = "\n";
+
+			// Check if variant exists
+			$cfVariants = [];
+			if($files->exists($cacheName)) {
+				foreach(explode($cacheDelimiter, $files->fileGetContents($cacheName)) as $n) {
+					$cfVariants[] = trim($n);
+				}
+			}
+
+			if(!in_array($cfVariant, $cfVariants)) {
+
+				$endpoint = 'images/v1/variants';
+
+				// Check Cloudflare
+				$response = $this->apiRequest(
+					"$endpoint/$cfVariant",
+					[],
+					'GET',
+					false
+				);
+
+				if(!($response['success'] ?? false)) {
+
+					// Create the variant
+					$response = $this->apiRequest(
+						$endpoint,
+						[
+							'id' => $cfVariant,
+							'options' => $cfImage,
+						],
+					);
+
+					if($response['success'] ?? false) {
+						$cfVariants[] = $cfVariant;
+						$files->filePutContents($cacheName, implode($cacheDelimiter, $cfVariants));
+					}
+				}
+			}
+
+			$pageimage->set('cfVariant', $cfVariant);
+
+			*/
 
 			$pageimage->set('cfImage', $cfImage);
 		}
@@ -510,10 +574,11 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 * @param string $endpoint
 	 * @param array|string $data
 	 * @param string $method
+	 * @param bool $logErrors
 	 * @return array
 	 *
 	 */
-	protected function apiRequest($endpoint = '', $data = [], $method = 'POST') {
+	protected function apiRequest($endpoint = '', $data = [], $method = 'POST', $logErrors = true) {
 
 		$http = $this->wire(new WireHttp());
 
@@ -545,7 +610,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			);
 
 		$response = $response ? (json_decode($response, 1) ?? [$response]) : [];
-		if(!($response['success'] ?? false)) {
+		if(!($response['success'] ?? false) && $logErrors) {
 			$this->log(json_encode($response));
 		}
 
