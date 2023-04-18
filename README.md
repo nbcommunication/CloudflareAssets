@@ -69,11 +69,8 @@ To get your **Access Key ID** and **Secret Access Key**:
 ### Images
 - **Account hash**: This can be found in the right sidebar on the Images dashboard.
 
-#### Flexible Variants
-At the moment, in order for image variants to work correctly, *Flexible variants* needs to be enabled in Cloudflare. You can do this in Images > Variants.
-
 ## Usage
-Once correctly configured, you shouldn't need to *use* the module at all; all `url()` and `httpUrl()` calls will be replaced by the appropriate URL from Cloudflare. Calls to `Pageimage::size()` will skip generating a variant on the local filesystem and will instead return a flexible variant URL from Cloudflare. Currently not all options from `size()` are mapped to flexible variant options, but width, height and focus point will be used.
+Once correctly configured, you shouldn't need to *use* the module at all; all `url()` and `httpUrl()` calls will be replaced by the appropriate URL from Cloudflare. Calls to `Pageimage::size()` will skip generating a variant on the local filesystem and will instead return a variant URL from Cloudflare. Currently not all options from `size()` are mapped to variant options, but width, height and focus point will be used. More information on the available options is coming soon.
 
 ### Notes on Image Size Limitations
 From https://developers.cloudflare.com/images/cloudflare-images/upload-images/formats-limitations/
