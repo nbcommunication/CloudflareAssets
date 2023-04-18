@@ -33,7 +33,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'Cloudflare Assets',
-			'version' => 2,
+			'version' => 3,
 			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
