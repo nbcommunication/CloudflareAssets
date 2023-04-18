@@ -19,6 +19,7 @@
  *
  * @property array $allowedOrigins
  * @property S3Client $s3
+ * @property int $totalVariants
  *
  */
 
@@ -33,7 +34,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'Cloudflare Assets',
-			'version' => 3,
+			'version' => 4,
 			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
@@ -45,6 +46,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	}
 
 	const formDataBoundary = '---011000010111000001101001';
+	const maxVariants = 100;
 	const streamExtensions = 'mp4 mkv mov avi flv webm mpg';
 
 	/**
@@ -62,6 +64,14 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 *
 	 */
 	protected $s3 = null;
+
+	/**
+	 * The total number of variants in Cloudflare Images
+	 *
+	 * @var int
+	 *
+	 */
+	protected $totalVariants = 0;
 
 	/**
 	 * Initialize the module
@@ -331,7 +341,6 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 *
 	 * @param HookEvent $event
 	 * @return string
-	 * @see https://developers.cloudflare.com/images/cloudflare-images/transform/flexible-variants/
 	 *
 	 */
 	public function hookPageimageSize(HookEvent $event) {
@@ -583,6 +592,8 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				$cfImageName['tr'] = $_a2s($options['trim']);
 			}
 
+			$cache = $this->wire()->cache;
+			$config = $this->wire()->config;
 			$files = $this->wire()->files;
 
 			$cfVariant = 'w' . ($_issetInt($options, 'nameWidth') ? $options['nameWidth'] : ($cfImage['width'] ?? 0)) .
@@ -603,7 +614,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 			$cfVariant = substr($this->wire()->sanitizer->alphanumeric($cfVariant), 0, 100);
 
-			$cacheName = "{$this->wire()->config->paths->cache}{$this->className}.cache";
+			$cacheName = "{$config->paths->cache}{$this->className}.cache";
 			$cacheDelimiter = "\n";
 
 			// Check if variant exists
@@ -617,9 +628,54 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				}
 			}
 
-			if(!in_array($cfVariant, $cfVariants)) {
+			$endpoint = 'images/v1/variants';
 
-				$endpoint = 'images/v1/variants';
+			// If the number of variants is approaching the maximum (4/5 used), notify the admin
+			$maxVariants = 100;
+			$totalVariants = count($cfVariants);
+			if(!$this->totalVariants) {
+				$this->totalVariants = $cache->getFor($this, 'totalVariants', 'daily', function() use ($endpoint) {
+					$response = $this->apiRequest(
+						$endpoint,
+						[],
+						'GET',
+						false
+					);
+					if($response['success'] ?? false) {
+						return count($response['result']['variants'] ?? [1]);
+					}
+					return 1;
+				});
+			}
+
+			if($totalVariants / $maxVariants > 0.8 || $this->totalVariants / $maxVariants > 0.8) {
+
+				$cache->getFor($this, 'totalVariantsNotifyAdmin', 'daily', function() use ($config, $maxVariants, $totalVariants) {
+
+					$warning = sprintf(
+						$this->_('The number of variants you have used (%1$d on Cloudflare, %2$d on this site) is approaching the maximum of %3$d.'),
+						$this->totalVariants,
+						$totalVariants,
+						$maxVariants
+					);
+
+					$this->log($warning);
+
+					$adminEmail = $config->adminEmail;
+					if($adminEmail) {
+						$this->wire()->mail->new()
+							->to($adminEmail)
+							->subject(sprintf($this->_('%1$s on %2$s'), $this->className, $config->httpHost))
+							->body($warning)
+							->send();
+						return 2;
+					}
+
+					return 1;
+				});
+			}
+
+			if(!in_array($cfVariant, $cfVariants)) {
 
 				// Check Cloudflare
 				$response = $this->apiRequest(
