@@ -20,8 +20,6 @@
  * @property array $allowedOrigins
  * @property S3Client $s3
  *
- * @todo Implementation of additional Pageimage options
- *
  */
 
 class CloudflareAssets extends WireData implements Module, ConfigurableModule {
@@ -35,7 +33,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'Cloudflare Assets',
-			'version' => 002,
+			'version' => 2,
 			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
@@ -170,37 +168,11 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			}
 
 			if($this->useImages($pagefile)) {
-
-				$url .= "/cdn-cgi/imagedelivery/{$this->accountHash}/$uid/" . //($pagefile->cfVariant ?? 'public')
-				(
-					isset($pagefile->cfImage) && is_array($pagefile->cfImage) ?
-						http_build_query($pagefile->cfImage, '', ',') :
-						'public'
-				);
-
-				//https://example.com/cdn-cgi/imagedelivery/
-
+				$url .= "/cdn-cgi/imagedelivery/{$this->accountHash}/$uid/" . ($pagefile->cfVariant ?? 'public');
 			} else if($this->useStream($pagefile)) {
-
 				$url = "https://{$this->customerSubdomain}/$uid/iframe";
-
 			} else {
-
 				$url .= "/$uid";
-
-				/*$url = $this->wire()->cache->getFor($this, $uid, 3600, function() use ($uid) {
-
-					// The second parameter allows you to determine how long the presigned link is valid.
-					$request = $this->s3->createPresignedRequest(
-						$this->s3->getCommand('GetObject', [
-							'Bucket' => $this->bucket,
-							'Key' => $uid,
-						]),
-						'+1 hour' // figure out how to work this with caching
-					);
-
-					return (string) $request->getUri();
-				});*/
 			}
 
 			$event->replace = true;
@@ -374,77 +346,262 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 			if(!is_array($options)) $options = $pageimage->sizeOptionsToArray($options);
 
+			// is set and is int
+			$_issetInt = function($a, $b) {
+				return isset($a[$b]) && is_int($a[$b]);
+			};
+
+			// is center
+			$_isCenter = function($x, $y) {
+				return $x === 0.5 && $y === 0.5;
+			};
+
+			// Clouflare Image settings
 			$cfImage = [
-				'fit' => 'crop',
-				'format' => 'auto', // todo remove for named variants
-				'height' => $height,
-				'width' => $width,
+				'fit' => ($options['upscaling'] ?? true) ? 'cover' : 'crop', // PW default is true
 			];
 
-			$focus = $pageimage->focus();
-			if($focus) {
-				$cfImage['gravity'] = ((float) $focus['left'] / 100) . 'x' . ((float) $focus['top'] / 100);
+			if($width) {
+				$cfImage['width'] = $width;
 			}
 
+			if($height) {
+				$cfImage['height'] = $height;
+			}
+
+			$cfImageName = [];
+
+			// Gravity (focus point)
+			$focus = $pageimage->focus();
+			if($focus) {
+				$x = (float) $focus['left'] / 100;
+				$y = (float) $focus['top'] / 100;
+				if($_isCenter($x, $y)) {
+					$cfImage['gravity'] = [
+						'x' => $x,
+						'y' => $y,
+					];
+				}
+			}
+
+			// Cropping
+			if(isset($options['cropping'])) {
+				if(
+					(is_bool($options['cropping']) && !$options['cropping']) ||
+					(is_string($options['cropping']) && empty($options['cropping']))
+				) {
+					$cfImage['fit'] = 'scale-down';
+				} else if(is_string($options['cropping'])) {
+
+					$x = 0.5;
+					$y = 0.5;
+					switch($options['cropping']) {
+						case 'north':
+						case 'n':
+							$y = 0;
+							break;
+						case 'northwest':
+						case 'nw':
+							$x = 0;
+							$y = 0;
+							break;
+						case 'northeast':
+						case 'ne':
+							$x = 1;
+							$y = 0;
+							break;
+						case 'south':
+						case 's':
+							$y = 1;
+							break;
+						case 'southwest':
+						case 'sw':
+							$x = 0;
+							$y = 1;
+							break;
+						case 'southeast':
+						case 'se':
+							$x = 1;
+							$y = 1;
+							break;
+						case 'west':
+						case 'w':
+							$x = 0;
+							break;
+						case 'east':
+						case 'e':
+							$x = 1;
+							break;
+					}
+
+					if($_isCenter($x, $y)) {
+						$cfImage['gravity'] = [
+							'x' => $x,
+							'y' => $y,
+						];
+					}
+				}
+			}
+
+			if(
+				isset($options['gravity']) &&
+				(
+					(
+						is_string($options['gravity']) &&
+						in_array($options['gravity'], [
+							'auto',
+							'left',
+							'right',
+							'top',
+							'bottom',
+						])
+					) ||
+					(
+						is_array($options['gravity']) &&
+						($_issetInt($options['gravity'], 'x') && $options['gravity']['x'] <= 1) &&
+						($_issetInt($options['gravity'], 'y') && $options['gravity']['y'] <= 1) &&
+						!$_isCenter($options['gravity']['x'], $options['gravity']['y'])
+					)
+				)
+			) {
+				$cfImage['gravity'] = $options['gravity'];
+			}
+
+			// HiDPI -> DPR
+			if($options['hidpi'] ?? false) {
+				$options['dpr'] = 2;
+				$options['fit'] = 'cover';
+			}
+
+			// Sharpening
+			if($options['sharpening'] ?? '') {
+				$options['sharpen'] = [
+					'none' => 0,
+					'soft' => 0.25,
+					'medium' => 0.5,
+					'strong' => 0.8,
+				][$options['sharpening']] ?? 0.25; // PW default is soft
+			}
+
+			// Bool values
+			if(isset($options['anim'])) {
+				$cfImage['anim'] = (bool) $options['anim'];
+				$cfImageName['an'] = (int) $options['anim'];
+			}
+
+			// Integer values
 			foreach([
-				'anim',
-				'background',
 				'blur',
-				'border',
-				'brightness',
-				'contrast',
 				'dpr',
-				'fit',
-				'format', // todo remove for named variants
-				'gamma',
-				'gravity',
 				'height',
-				'metadata',
-				'quality', // automatically mapped
-				'rotate', // automatically mapped
-				'sharpen',
-				'trim',
+				'rotate',
 				'width',
 			] as $key) {
 				if(isset($options[$key])) {
-					$cfImage[$key] = $options[$key];
-				}
-			}
-
-			foreach([
-				'upscaling' => 'fit',
-				'cropping' => 'gravity',
-				'sharpening' => 'sharpen',
-			] as $pwKey => $cfKey) {
-				if(isset($options[$pwKey])) {
-					$value = $options[$pwKey];
-					switch($pwKey) {
-						case 'upscaling':
-							// todo change 'fit' to cover?
-							break;
-						case 'cropping':
-							// todo convert to gravity
-							break;
-						case 'sharpening':
-							$value = [
-								'none' => 0,
-								'soft' => 1,
-								'medium' => 5,
-								'strong' => 10,
-							][$value];
-							break;
+					$value = (int) $options[$key];
+					if($value) {
+						$cfImage[$key] = $value;
+						if(!in_array($key, ['width', 'height'])) {
+							$cfImageName[$key] = $value;
+						}
 					}
-					$cfImage[$cfKey] = $value;
 				}
 			}
 
-			/*
+			// Float values
+			foreach([
+				'brightness',
+				'contrast',
+				'gamma',
+				'sharpen',
+			] as $key) {
+				if(isset($options[$key])) {
+					$value = (float) $options[$key];
+					if($value) {
+						$max = $key === 'sharpen' ? 10 : 2;
+						if($value > $max) {
+							$value = $max;
+						}
+						$cfImage[$key] = $value;
+						$cfImageName[$key] = $value;
+					}
+				}
+			}
 
-			named variants
+			// String values
+			foreach([
+				'background',
+				'fit',
+				'metadata',
+			] as $key) {
+				if(isset($options[$key])) {
+					$value = (string) $options[$key];
+					if($value) {
+						$cfImage[$key] = $value;
+						if($key !== 'fit') {
+							$cfImageName[$key] = $value;
+						}
+					}
+				}
+			}
+
+			$_a2s = function($a) {
+				$s = '';
+				foreach($a as $k => $v) {
+					$s .= substr($k, 0, 1) . $v;
+				}
+				return $s;
+			};
+
+			if(
+				isset($options['border']) &&
+				is_array($options['border']) &&
+				isset($options['border']['color']) &&
+				is_string($options['border']['color']) &&
+				(
+					$_issetInt($options['border'], 'width') ||
+					(
+						$_issetInt($options['border'], 'top') &&
+						$_issetInt($options['border'], 'right') &&
+						$_issetInt($options['border'], 'bottom') &&
+						$_issetInt($options['border'], 'left')
+					)
+				)
+			) {
+				$cfImage['border'] = $options['border'];
+				$cfImageName['bo'] = $_a2s($options['border']);
+			}
+
+			if(
+				isset($options['trim']) &&
+				$_issetInt($options['trim'], 'top') &&
+				$_issetInt($options['trim'], 'right') &&
+				$_issetInt($options['trim'], 'bottom') &&
+				$_issetInt($options['trim'], 'left')
+			) {
+				$cfImage['trim'] = $options['trim'];
+				$cfImageName['tr'] = $_a2s($options['trim']);
+			}
 
 			$files = $this->wire()->files;
 
-			$cfVariant = $this->wire()->sanitizer->alphanumeric(http_build_query($cfImage, '', 'I'));
+			$cfVariant = 'w' . ($_issetInt($options, 'nameWidth') ? $options['nameWidth'] : ($cfImage['width'] ?? 0)) .
+				'h' . ($_issetInt($options, 'nameHeight') ? $options['nameHeight'] : ($cfImage['height'] ?? 0)) .
+				substr($cfImage['fit'], 0, 3);
+
+			if(isset($cfImage['gravity'])) {
+				$cfVariant .= is_array($cfImage['gravity']) ? json_encode($cfImage['gravity']) : $cfImage['gravity'];
+			}
+
+			foreach($cfImageName as $key => $value) {
+				$cfVariant .= substr($key, 0, 2) . $value;
+			}
+
+			if(isset($options['suffix']) && !empty($options['suffix'])) {
+				$cfVariant .= $options['suffix'];
+			}
+
+			$cfVariant = substr($this->wire()->sanitizer->alphanumeric($cfVariant), 0, 100);
 
 			$cacheName = "{$this->wire()->config->paths->cache}{$this->className}.cache";
 			$cacheDelimiter = "\n";
@@ -453,7 +610,10 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			$cfVariants = [];
 			if($files->exists($cacheName)) {
 				foreach(explode($cacheDelimiter, $files->fileGetContents($cacheName)) as $n) {
-					$cfVariants[] = trim($n);
+					$n = trim($n);
+					if($n) {
+						$cfVariants[] = $n;
+					}
 				}
 			}
 
@@ -488,10 +648,6 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			}
 
 			$pageimage->set('cfVariant', $cfVariant);
-
-			*/
-
-			$pageimage->set('cfImage', $cfImage);
 		}
 
 		$event->return = $pageimage;
