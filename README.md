@@ -7,7 +7,7 @@ The main purpose of this module is to allow ProcessWire to be used in an auto-sc
 # How it works
 When a `Pagefile` is added in the admin or via the API, it is uploaded to Cloudflare's R2 storage service. Additionally, if the file is an image, it is uploaded to Cloudflare Images, and if the file is a video it is uploaded to Cloudflare Stream. When a URL for the `Pagefile` is requested e.g. `$pagefile->url()`, the appropriate Cloudflare URL is returned.
 
-As ProcessWire's admin still requires the file to be available locally, in a multi-instance setup if a file is not available it is downloaded from the 'master' copy in R2.
+As ProcessWire's admin still requires the file to be available locally, in a multi-instance setup if a file is not available it is downloaded from the 'master' copy in R2. Conversely, if an uploaded file is on the local filesystem, but not in Cloudflare's services, it will attempt to add it. This should allow the module to function where files and images have already been uploaded at the time of install.
 
 ## Installation
 1. Download the [zip file](https://github.com/nbcommunication/CloudflareAssets/archive/master.zip) at Github or clone the repo into your `site/modules` directory.
@@ -68,6 +68,9 @@ To get your **Access Key ID** and **Secret Access Key**:
 
 ### Images
 - **Account hash**: This can be found in the right sidebar on the Images dashboard.
+
+### Only Uploads?
+If this is enabled, assets will continue to be uploaded to Cloudflare if authorised, but will be served by the local filesystem. It switches off the `Pagefile::url()`, `Pagefile::httpUrl()` and `Pageimage::size()` hooks. If you encounter a problem with your Cloudflare setup, this option allows you to revert to the default without completely removing the integration.
 
 ## Usage
 Once correctly configured, you shouldn't need to *use* the module at all; all `url()` and `httpUrl()` calls will be replaced by the appropriate URL from Cloudflare. Calls to `Pageimage::size()` will skip generating a variant on the local filesystem and will instead return a variant URL from Cloudflare. Currently not all options from `size()` are mapped to variant options, but width, height and focus point will be used. More information on the available options is coming soon.

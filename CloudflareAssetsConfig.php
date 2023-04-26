@@ -16,6 +16,7 @@ class CloudflareAssetsConfig extends ModuleConfig {
 	public function getDefaults() {
 		return [
 			'allowedOriginsList' => implode("\n", $this->wire()->config->httpHosts),
+			'onlyUploads' => 0,
 		];
 	}
 
@@ -148,6 +149,17 @@ class CloudflareAssetsConfig extends ModuleConfig {
 		]);
 
 		$inputfields->add($fieldset);
+
+		$inputfields->add([
+			'type' => 'toggle',
+			'name' => 'onlyUploads',
+			'value' => $this->onlyUploads,
+			'label' => $this->_('Only Uploads?'),
+			'description' => $this->_('If this is enabled, assets will continue to be uploaded to Cloudflare if authorised by the details entered above, but will be served by the local filesystem.'),
+			'notes' => $this->_('If you encounter a problem with your Cloudflare setup, this option allows you to revert to the default without completely removing the integration.'),
+			'icon' => 'cloud-upload',
+			'collapsed' => 1,
+		]);
 
 		return $inputfields;
 	}

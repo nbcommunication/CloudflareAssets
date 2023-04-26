@@ -16,6 +16,7 @@
  * @property string $customerSubdomain
  * @property string $allowedOriginsList
  * @property string $accountHash
+ * @property bool $onlyUploads
  *
  * @property array $allowedOrigins
  * @property S3Client $s3
@@ -34,7 +35,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'Cloudflare Assets',
-			'version' => 4,
+			'version' => 5,
 			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
@@ -143,8 +144,13 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 			// If authenticated, attach hooks
 			if($tokenVerified) {
-				$this->addHook('Pagefile::url()', $this, 'hookPagefileUrl');
-				$this->addHook('Pagefile::httpUrl()', $this, 'hookPagefileHttpUrl');
+
+				if(!$this->onlyUploads) {
+					$this->addHook('Pagefile::url()', $this, 'hookPagefileUrl');
+					$this->addHook('Pagefile::httpUrl()', $this, 'hookPagefileHttpUrl');
+					$this->addHook('Pageimage::size()', $this, 'hookPageimageSize');
+				}
+
 				$this->addHookProperty('Pagefile::s3', $this, 'hookPagefileS3');
 
 				$this->addHookAfter('PagefilesManager::save', $this, 'hookPagefilesManagerSave');
@@ -152,8 +158,6 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				$this->addHookBefore('InputfieldFile::render', $this, 'hookInputfieldFileRender');
 
 				$this->addHookAfter('Pagefiles::delete', $this, 'hookPagefilesDelete');
-
-				$this->addHook('Pageimage::size()', $this, 'hookPageimageSize');
 			}
 		}
 	}
@@ -291,15 +295,17 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 			foreach($event->object->value as $pagefile) {
 
-				$uid = $this->uid($pagefile);
-				if($uid) {
-					// If the file does not exist, copy it from R2
-					if(!file_exists($pagefile->filename)) {
-						file_put_contents($pagefile->filename, fopen("s3://{$this->bucket}/$pagefile->s3", 'r'));
-					}
-				} else {
-					// If the file already stored in Cloudflare, store it
+				$localFile = $pagefile->filename;
+				$remoteFile = "s3://{$this->bucket}/$pagefile->s3";
+				$hasLocalFile = file_exists($localFile);
+				$hasRemoteFile = file_exists($remoteFile);
+
+				if($hasLocalFile && !$hasRemoteFile) {
+					// Add the file to Cloudflare
 					$this->addToCloudflare($pagefile);
+				} else if(!$hasLocalFile && $hasRemoteFile) {
+					// Get the file from R2
+					file_put_contents($localFile, fopen($remoteFile, 'r'));
 				}
 			}
 		}
