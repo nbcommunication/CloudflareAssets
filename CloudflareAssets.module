@@ -301,9 +301,17 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				$hasRemoteFile = file_exists($remoteFile);
 
 				if($hasLocalFile && !$hasRemoteFile) {
+
 					// Add the file to Cloudflare
 					$this->addToCloudflare($pagefile);
+					// Save quietly so id can be saved in filedata
+					$this->wire()->pages->___save($pagefile->page, [
+						'noHooks' => true,
+						'quiet' => true,
+					]);
+
 				} else if(!$hasLocalFile && $hasRemoteFile) {
+
 					// Get the file from R2
 					file_put_contents($localFile, fopen($remoteFile, 'r'));
 				}
