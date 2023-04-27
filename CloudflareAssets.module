@@ -35,7 +35,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'Cloudflare Assets',
-			'version' => 5,
+			'version' => 6,
 			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
@@ -145,19 +145,28 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			// If authenticated, attach hooks
 			if($tokenVerified) {
 
-				if(!$this->onlyUploads) {
+				$page = $this->wire()->page;
+				$notAdmin = $page->template->name !== 'admin' && strpos($page->url, $this->wire()->config->urls->admin) !== 0;
+
+				if(!$this->onlyUploads && $notAdmin) {
+					// If not the admin, and not upload only mode
 					$this->addHook('Pagefile::url()', $this, 'hookPagefileUrl');
 					$this->addHook('Pagefile::httpUrl()', $this, 'hookPagefileHttpUrl');
 					$this->addHook('Pageimage::size()', $this, 'hookPageimageSize');
 				}
 
-				$this->addHookProperty('Pagefile::s3', $this, 'hookPagefileS3');
+				$this->addHookProperty('Pagefile::r2Key', $this, 'hookPagefileR2Key');
+				$this->addHookProperty('Pagefile::r2Path', $this, 'hookPagefileR2Path');
 
 				$this->addHookAfter('PagefilesManager::save', $this, 'hookPagefilesManagerSave');
 
 				$this->addHookBefore('InputfieldFile::render', $this, 'hookInputfieldFileRender');
 
 				$this->addHookAfter('Pagefiles::delete', $this, 'hookPagefilesDelete');
+
+				if($notAdmin) {
+					$this->addHookAfter('Page::render', $this, 'hookPageRender', ['priority' => 199]);
+				}
 			}
 		}
 	}
@@ -211,16 +220,29 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
-	 * Hook Pagefile::s3
+	 * Hook Pagefile::r2Key
 	 *
-	 * Return the s3 'Key' for this Pagefile
+	 * Return the R2 'Key' for this Pagefile
 	 *
 	 * @param HookEvent $event
 	 * @return string
 	 *
 	 */
-	public function hookPagefileS3(HookEvent $event) {
+	public function hookPagefileR2Key(HookEvent $event) {
 		$event->return = "{$event->object->page->id}/{$event->object->basename}";
+	}
+
+	/**
+	 * Hook Pagefile::r2Path
+	 *
+	 * Return the R2 'Path' for this Pagefile
+	 *
+	 * @param HookEvent $event
+	 * @return string
+	 *
+	 */
+	public function hookPagefileR2Path(HookEvent $event) {
+		$event->return = "s3://{$this->bucket}/{$event->object->r2Key}";
 	}
 
 	/**
@@ -296,7 +318,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			foreach($event->object->value as $pagefile) {
 
 				$localFile = $pagefile->filename;
-				$remoteFile = "s3://{$this->bucket}/$pagefile->s3";
+				$remoteFile = $pagefile->r2Path;
 				$hasLocalFile = file_exists($localFile);
 				$hasRemoteFile = file_exists($remoteFile);
 
@@ -344,9 +366,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				);
 			}
 
-			if(unlink("s3://{$this->bucket}/$pagefile->s3")) {
-				$this->wire()->cache->deleteFor($this, $pagefile->s3);
-			}
+			unlink($pagefile->r2Path);
 		}
 	}
 
@@ -771,8 +791,8 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 			// All files are placed in R2 via s3
 			// But we only need to set the uid if the file is only in the r2 bucket
-			if(file_put_contents("s3://{$this->bucket}/$pagefile->s3", fopen($pagefile->filename, 'r')) && $r2Only) {
-				$uid = $pagefile->s3;
+			if(file_put_contents($pagefile->r2Path, fopen($pagefile->filename, 'r')) && $r2Only) {
+				$uid = $pagefile->r2Key;
 			}
 
 			if(isset($uid)) {
@@ -781,6 +801,105 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		}
 
 		return $uid;
+	}
+
+	/**
+	 * Hook called after a page is rendered
+	 *
+	 * Look for local links that should be replaced with Cloudflare links
+	 *
+	 * @param HookEvent $event
+	 *
+	 */
+	public function hookPageRender(HookEvent $event) {
+
+		$page = $event->object;
+
+		$contentType = $page->template->contentType;
+		$isHTML = !$contentType || $contentType === 'html' || $contentType === 'text/html';
+		if($isHTML) $isHTML = stripos($event->return, '</html>') !== false;
+		$out = $event->return;
+
+		if($isHTML) {
+
+			$urlFiles = $this->wire()->config->urls('files');
+
+			if(preg_match_all(
+				'/="(' . str_replace('/', '\/', $urlFiles) . '\d+\/.*?)"/',
+				$out,
+				$matches
+			)) {
+
+				$fileFields = [];
+				$replacements = [];
+
+				foreach($matches[0] as $key => $fullMatch) {
+
+					$matchUrl = $matches[1][$key];
+
+					// If the file exists somewhere outside our files, skip
+					if(strpos($matchUrl, $urlFiles) !== 0) continue;
+
+					// Determine page id that owns file from its URL
+					$id = str_replace($urlFiles, '', dirname($matchUrl));
+
+					// If extended paths are in use, remove slashes
+					if(strpos($id, '/') !== false) $id = str_replace('/', '', $id);
+
+					// Get page from the id
+					$id = (int) $id;
+					$p = $id === $page->id ? $page : $this->wire()->pages->get($id);
+
+					// If the page isn't a page, skip
+					if(!$p->id) continue;
+
+					// Get the image fields for this page
+					if(!isset($fileFields[$p->id])) {
+
+						$fileFields[$p->id] = [];
+
+						foreach($p->template->fieldgroup as $field) {
+							if(!$field->type instanceof FieldtypeFile && !$field->type instanceof FieldtypeImage) continue;
+							$v = $p->get($field->name);
+							if(empty($v)) continue;
+							if($v instanceof Pagefile) $v = $v->pagefiles;
+							if(!$v instanceof Pagefiles) continue;
+							if(!$v->count()) continue;
+							$fileFields[$p->id][$field->name] = $v;
+						}
+					}
+
+					$pagefile = null;
+					$filename = basename($matchUrl);
+
+					foreach($fileFields[$p->id] as $fileField) {
+						$pagefile = $fileField->getFile($filename);
+						if($pagefile) break;
+					}
+
+					if($pagefile && $pagefile instanceof Pagefile && $this->uid($pagefile)) {
+
+						if($pagefile instanceof Pageimage) {
+							// Resize if a variation
+							if(preg_match('/\.(\d+)x(\d+)(.*?)\./', $filename, $dimensions)) {
+								$pagefile = $pagefile->size((int) $dimensions[1] ?: 0, (int) $dimensions[2] ?: 0, [
+									'hidpi' => strpos($dimensions[3] ?? '', 'hidpi') !== false,
+								]);
+							}
+							$replacements[$matchUrl] = $pagefile->url;
+						} else {
+							$replacements[$matchUrl] = $pagefile->url;
+						}
+					}
+				}
+
+				if(count($replacements)) {
+					$out = str_replace(array_keys($replacements), array_values($replacements), $out);
+				}
+			}
+
+			$event->return = $out;
+		}
 	}
 
 	/**
