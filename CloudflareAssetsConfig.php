@@ -16,6 +16,7 @@ class CloudflareAssetsConfig extends ModuleConfig {
 	public function getDefaults() {
 		return [
 			'allowedOriginsList' => implode("\n", $this->wire()->config->httpHosts),
+			'imageDelivery' => 0,
 			'onlyUploads' => 0,
 		];
 	}
@@ -32,6 +33,7 @@ class CloudflareAssetsConfig extends ModuleConfig {
 		$modules = $this->wire()->modules;
 
 		$inputfields = parent::getInputfields();
+
 		// Get the module this configures
 		$module = $modules->get(str_replace('Config', '', $this->className));
 
@@ -148,17 +150,30 @@ class CloudflareAssetsConfig extends ModuleConfig {
 			'icon' => 'hashtag',
 		]);
 
+		$deliveryUrl = 'https://imagedelivery.net/';
+		$fieldset->add([
+			'type' => 'checkbox',
+			'name' => 'imageDelivery',
+			'value' => $this->imageDelivery,
+			'label' => $this->_('Use Image Delivery URL?'),
+			'checkboxLabel' => sprintf($this->_('Serve my images from %s'), $deliveryUrl),
+			'description' => sprintf($this->_('If this is enabled, the custom domain entered will not be used and images will be served from %s.'), $deliveryUrl),
+			'icon' => 'globe',
+			'collapsed' => 2,
+		]);
+
 		$inputfields->add($fieldset);
 
 		$inputfields->add([
-			'type' => 'toggle',
+			'type' => 'checkbox',
 			'name' => 'onlyUploads',
 			'value' => $this->onlyUploads,
 			'label' => $this->_('Only Uploads?'),
+			'checkboxLabel' => $this->_('Serve assets from the local filesystem'),
 			'description' => $this->_('If this is enabled, assets will continue to be uploaded to Cloudflare if authorised by the details entered above, but will be served by the local filesystem.'),
 			'notes' => $this->_('If you encounter a problem with your Cloudflare setup, this option allows you to revert to the default without completely removing the integration.'),
 			'icon' => 'cloud-upload',
-			'collapsed' => 1,
+			'collapsed' => 2,
 		]);
 
 		return $inputfields;

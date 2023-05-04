@@ -68,12 +68,13 @@ To get your **Access Key ID** and **Secret Access Key**:
 
 ### Images
 - **Account hash**: This can be found in the right sidebar on the Images dashboard.
+- **Use Image Delivery URL**: If enabled, Cloudflare's imagedelivery.net is used to server image instead of the custom domain.
 
 ### Only Uploads?
 If this is enabled, assets will continue to be uploaded to Cloudflare if authorised, but will be served by the local filesystem. It switches off the `Pagefile::url()`, `Pagefile::httpUrl()` and `Pageimage::size()` hooks. If you encounter a problem with your Cloudflare setup, this option allows you to revert to the default without completely removing the integration.
 
 ## Usage
-Once correctly configured, you shouldn't need to *use* the module at all; all `url()` and `httpUrl()` calls will be replaced by the appropriate URL from Cloudflare. Calls to `Pageimage::size()` will skip generating a variant on the local filesystem and will instead return a variant URL from Cloudflare. Currently not all options from `size()` are mapped to variant options, but width, height and focus point will be used. More information on the available options is coming soon.
+Once correctly configured, you shouldn't need to *use* the module at all; all `url()` and `httpUrl()` calls will be replaced by the appropriate URL from Cloudflare.
 
 ### Notes on Image Size Limitations
 From https://developers.cloudflare.com/images/cloudflare-images/upload-images/formats-limitations/
@@ -83,6 +84,8 @@ From https://developers.cloudflare.com/images/cloudflare-images/upload-images/fo
 - Image metadata is limited to 1024 bytes.
 - Images have a 10 megabyte (MB) size limit.
 - Animated GIFs, including all frames, are limited to 100 megapixels (MP).
+
+Please ensure you configure your image fields so they do not exceed these limits.
 
 ## Cloudflare Documentation
 - [R2](https://developers.cloudflare.com/r2/)
