@@ -36,7 +36,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'Cloudflare Assets',
-			'version' => 7,
+			'version' => 8,
 			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
@@ -151,7 +151,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 						$cache = $this->wire()->cache;
 						$cacheName = 'removeVariations';
 						$toRemove = $cache->getFor($this, $cacheName) ?? [];
-						if(count($toRemove)) {
+						if(is_array($toRemove) && count($toRemove)) {
 							foreach($toRemove as $filename) {
 								$this->wire()->files->unlink($filename);
 							}
@@ -166,6 +166,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 					$this->addHookAfter('Page::render', $this, 'hookPageRender', ['priority' => 199]);
 				}
 
+				$this->addHookProperty('Pagefile::getLocal', $this, 'hookPagefileGetLocal');
 				$this->addHookProperty('Pagefile::r2Key', $this, 'hookPagefileR2Key');
 				$this->addHookProperty('Pagefile::r2Path', $this, 'hookPagefileR2Path');
 
@@ -176,6 +177,18 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				$this->addHookAfter('Pagefiles::delete', $this, 'hookPagefilesDelete');
 			}
 		}
+	}
+
+	/**
+	 * Hook Pagefile::hookPagefileGetLocal()
+	 *
+	 * @param HookEvent $event
+	 * @return $this
+	 *
+	 */
+	public function hookPagefileGetLocal(HookEvent $event) {
+		$event->object->set($this->className, false);
+		$event->return = $event->object;
 	}
 
 	/**
@@ -190,7 +203,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		$pagefile = $event->object;
 		$uid = $this->uid($pagefile);
 
-		if($uid) {
+		if($uid && ($pagefile->get($this->className) ?? true)) {
 
 			$url = $this->domain;
 			if(strpos($url, '://') === false) {
@@ -251,7 +264,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public function hookPagefileHttpUrl(HookEvent $event) {
 		$pagefile = $event->object;
 		$uid = $this->uid($pagefile);
-		if($uid) {
+		if($uid && ($pagefile->get($this->className) ?? true)) {
 			$event->replace = true;
 			$event->return = $event->object->url();
 		}

@@ -76,6 +76,12 @@ If this is enabled, assets will continue to be uploaded to Cloudflare if authori
 ## Usage
 Once correctly configured, you shouldn't need to *use* the module at all; all `url()` and `httpUrl()` calls will be replaced by the appropriate URL from Cloudflare.
 
+To override the Cloudflare URL, call `getLocal` on the `Pagefile` prior to calling `url()` or `httpUrl()`:
+
+```php
+$url = $pagefile->getLocal->url;
+```
+
 ### Notes on Image Size Limitations
 From https://developers.cloudflare.com/images/cloudflare-images/upload-images/formats-limitations/
 
