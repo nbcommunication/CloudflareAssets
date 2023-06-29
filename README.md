@@ -22,28 +22,31 @@ To configure this module, go to Modules > Configure > CloudflareAssets. In anoth
 The following settings are used for more than one service:
 - **Account ID**: You should find this at the top of right sidebar on any of the main screens for R2 / Stream / Images.
 - **Access Token**: This is used for API access for Stream and Images. See *Creating an API Token* below.
-- **Custom domain**: This must be a domain managed and served by Cloudflare. See *Creating a custom domain* below.
+- **Custom domain**: This must be a domain managed and served by Cloudflare. See *Using a custom domain* below.
 
 ### Creating an API Token
 To create an API token:
 - Navigate to My Profile > API Tokens.
 - Click *Create Token*.
-- Click *Use template* for **Read and write to Cloudflare Stream and Images**.
+- Under *API token templates* click **Read and write to Cloudflare Stream and Images**.
 - Remove *Read* access for *Account Analytics*.
 - In *Account Resources* select the account you will be using - it does not need access to all accounts.
 - If you have a static IP or IP range and wish to limit access by this, enter it in *Client IP Address Filtering*.
 - If you wish to time limit the token, set a range in *TTL* (not recommended for the purposes of this module).
 - Click *Continue to summary*.
+- Click *Create Token* and then copy the token to somewhere safe.
 
-### Creating a custom domain
-Coming soon: These instructions will be written in the near future (May 2023).
+### Using a custom domain
+To use a custom domain you need to either register a domain with Cloudflare or transfer a domain to your Cloudflare account.
 
 #### Connecting your custom domain
 Your custom domain needs to be manually connected to your bucket.
 - In your bucket dashboard go to Settings > Public access > Custom Domains.
 - Click *Connect Domain*.
-- Add the domain you wish to connect and click *Continue*.
+- Add the domain* you wish to connect and click *Continue*.
 - Allow Cloudflare to add the CNAME record by clicking *Connect domain*.
+
+\*You can use any subdomain of a domain you have in your Cloudflare account. This may be preferable for CDN usage e.g. cdn.mydomain.com.
 
 ### R2
 This information can be found in the R2 area of your Cloudflare account:
@@ -80,6 +83,150 @@ To override the Cloudflare URL, call `getLocal` on the `Pagefile` prior to calli
 
 ```php
 $url = $pagefile->getLocal->url;
+```
+
+### Migrating existing assets
+Once installed, you may need to add existing assets to the Cloudflare in a batch, instead of relying on the built-in functionality which will upload page assets when the page is edited. This script should provide a starting point for this:
+
+```php
+// Run on a template of your choosing...
+if($user->isSuperUser()) {
+
+	$cf = $modules->get('CloudflareAssets');
+	$fileFields = $fields->findByType('FieldtypeFile');
+
+	// Do a dry run to determine the number of files to be evaluated/uploaded
+	$dryRun = true;
+
+	$result = [];
+	// Use array_slice to limit the number of fields per request
+	foreach(array_slice($fileFields, 0, count($fileFields)) as $f) {
+		foreach($pages->find([
+			"$f->name!=" => '',
+			'include' => 'all',
+			'check_access' => 0,
+			//'limit' => 0, // Use these to limit the number of pages per request
+			//'start' => 0,
+		]) as $p) {
+
+			$p->of(false);
+			foreach($p->get($f->name) as $pagefile) {
+
+				$url = $pagefile->getLocal->url;
+				if($dryRun) {
+					$uid = $pagefile->filedata($cf->className);
+					$result[$url] = $uid ? 'already exists' : 'will be uploaded';
+				} else {
+					$uid = $cf->addToCloudflare($pagefile);
+					$result[$url] = $uid ? 'uploaded' : 'upload failed';
+				}
+			}
+
+			if($dryRun) {
+				$p->of(true);
+			} else {
+				$pages->___save($p, [
+					'noHooks' => true,
+					'quiet' => true,
+				]);
+			}
+		}
+	}
+
+	$result['count'] = count($result);
+
+	header('Content-Type: text/plain');
+	echo print_r($result, 1);
+
+	die();
+}
+```
+
+### Uninstalling
+If you are uninstalling this module it is recommended that you run the following script on all server instances it is installed on. If you have just used it on one instance (and local copies should be present), this script will still ensure that the Cloudflare IDs are also removed from file data. This assumes the reason for uninstalling is that you plan to unsubscribe from Cloudflare's services and do not plan to re-enable for the site in future.
+
+```php
+// Run on a template of your choosing...
+if($user->isSuperUser()) {
+
+	$cf = $modules->get('CloudflareAssets');
+	$fileFields = $fields->findByType('FieldtypeFile');
+
+	// Do a dry run to determine the number of files to be processed
+	$dryRun = false;
+
+	// Do you want to delete the files from R2? Files in Images/Stream need to be deleted manually
+	$r2Delete = false;
+
+	$result = [];
+	// Use array_slice to limit the number of fields per request
+	foreach(array_slice($fileFields, 0, count($fileFields)) as $f) {
+		foreach($pages->find([
+			"$f->name!=" => '',
+			'include' => 'all',
+			'check_access' => 0,
+			//'limit' => 0, // Use these to limit the number of pages per request
+			//'start' => 0,
+		]) as $p) {
+
+			$p->of(false);
+			foreach($p->get($f->name) as $pagefile) {
+
+				if($dryRun) {
+
+					$result[$pagefile->url] = $pagefile->getLocal->url;
+
+				} else {
+
+					$r = [];
+					if($pagefile->filedata($cf->className)) {
+
+
+						// Get from R2 if it doesn't exist
+						if(!file_exists($pagefile->filename)) {
+							if($files->filePutContents($pagefile->filename, fopen($pagefile->r2Path, 'r'))) {
+								$r['Downloaded'] = $pagefile->r2Path;
+							} else {
+								$r['Download Failed'] = "$pagefile->r2Path ($pagefile->url)";
+							}
+						}
+
+						if($r2Delete) {
+							unlink($pagefile->r2Path);
+							$r['Deleted'] = $pagefile->r2Path;
+						}
+
+						// Remove the CF ID
+						$r[$pagefile->url] = $pagefile->getLocal->url;
+						$pagefile->filedata(null, $cf->className);
+
+					} else {
+
+						$r[$pagefile->url] = 'No CF ID';
+					}
+
+					$result[] = $r;
+				}
+			}
+
+			if($dryRun) {
+				$p->of(true);
+			} else {
+				$pages->___save($p, [
+					'noHooks' => true,
+					'quiet' => true,
+				]);
+			}
+		}
+	}
+
+	$result['count'] = count($result);
+
+	header('Content-Type: text/plain');
+	echo print_r($result, 1);
+
+	die();
+}
 ```
 
 ### Notes on Image Size Limitations
