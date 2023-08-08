@@ -36,7 +36,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'Cloudflare Assets',
-			'version' => 8,
+			'version' => 10,
 			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
@@ -48,6 +48,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	}
 
 	const formDataBoundary = '---011000010111000001101001';
+	const imageVariantPrefix = 'iv:';
 	const maxVariants = 100;
 	const streamExtensions = 'mp4 mkv mov avi flv webm mpg';
 
@@ -73,12 +74,14 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 */
 	public function init() {
 
+		// We need these details to proceed
 		if($this->accountId && $this->bucket && $this->accessKeyId && $this->secretAccessKey) {
 
 			require_once __DIR__ . '/vendor/autoload.php';
 
 			try {
 
+				// Create the client
 				$this->s3 = new \Aws\S3\S3Client([
 					'region' => 'auto',
 					'endpoint' => "https://{$this->accountId}.r2.cloudflarestorage.com",
@@ -86,8 +89,10 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 					'credentials' => new \Aws\Credentials\Credentials($this->accessKeyId, $this->secretAccessKey),
 				]);
 
+				// Use the stream wrapper (native PHP functions)
 				$this->s3->registerStreamWrapperV2();
 
+				// If the bucket does not exist, create it
 				if(!$this->s3->doesBucketExistV2($this->bucket)) {
 					$this->s3->createBucket([
 						'Bucket' => $this->bucket,
@@ -104,6 +109,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			}
 		}
 
+		// Set the allowed origins for streams
 		$this->allowedOriginsList = trim($this->allowedOriginsList);
 		if($this->allowedOriginsList) {
 			$this->allowedOrigins = array_map(function($line) {
@@ -121,14 +127,16 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		// If authenticated with R2 and we have an API access token
 		if($this->s3 && $this->accessToken) {
 
+			$cache = $this->wire()->cache;
+
 			// Verify the credentials
 			$cacheKey = md5($this->accountId . $this->accessToken);
-			$tokenVerified = $this->wire()->cache->getFor($this, $cacheKey);
+			$tokenVerified = $cache->getFor($this, $cacheKey);
 			if(!$tokenVerified) {
 				$response = $this->apiRequest();
 				if($response['result']['status'] ?? '' === 'active') {
 					$tokenVerified = true;
-					$this->wire()->cache->saveFor($this, $cacheKey, 1, WireCache::expireNever);
+					$cache->saveFor($this, $cacheKey, 1, WireCache::expireNever);
 				} else {
 					// Remove access token
 					$this->log($this->_('Sorry, the Account ID / Access Token you provided is invalid.'));
@@ -141,14 +149,12 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			if($tokenVerified) {
 
 				// If not the admin
-				$page = $this->wire()->page;
-				if($page->template->name !== 'admin' && strpos($page->url, $this->wire()->config->urls->admin) !== 0) {
+				if($this->wire()->page->template->name !== 'admin' && strpos($this->wire()->page->url, $this->wire()->config->urls->admin) !== 0) {
 
 					// If not upload only mode
 					if(!$this->onlyUploads) {
 
 						// Check for variations that need to be removed
-						$cache = $this->wire()->cache;
 						$cacheName = 'removeVariations';
 						$toRemove = $cache->getFor($this, $cacheName) ?? [];
 						if(is_array($toRemove) && count($toRemove)) {
@@ -158,41 +164,100 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 							$cache->deleteFor($this, $cacheName);
 						}
 
+						// Replace local URLs with Cloudflare ones
 						$this->addHook('Pagefile::url()', $this, 'hookPagefileUrl');
 						$this->addHook('Pagefile::httpUrl()', $this, 'hookPagefileHttpUrl');
 					}
 
+					// After a variation is created +CloudFlare
+					// This is not required for the admin side as it does not serve Cloudflare URLs
 					$this->addHook('Pageimage::createdVariation', $this, 'hookPageimageCreatedVariation');
+
+					// When rendering the page, look for local links that should be replaced with Cloudflare links
 					$this->addHookAfter('Page::render', $this, 'hookPageRender', ['priority' => 199]);
 				}
 
-				$this->addHookProperty('Pagefile::getLocal', $this, 'hookPagefileGetLocal');
+				// Utility properties
+				$this->addHookProperty('Pagefile::localUrl', $this, 'hookPagefileLocalUrl');
+				$this->addHookProperty('Pagefile::localHttpUrl', $this, 'hookPagefileLocalHttpUrl');
 				$this->addHookProperty('Pagefile::r2Key', $this, 'hookPagefileR2Key');
 				$this->addHookProperty('Pagefile::r2Path', $this, 'hookPagefileR2Path');
 
+				// When a file is uploaded +CloudFlare
 				$this->addHookAfter('PagefilesManager::save', $this, 'hookPagefilesManagerSave');
 
+				// When a file input is rendered, check file availability
 				$this->addHookBefore('InputfieldFile::render', $this, 'hookInputfieldFileRender');
 
+				// When a page is deleted remove all Cloudflare assets
+				$this->addHookBefore('Pages::cloned', $this, 'hookPagesCloned');
+
+				// When a page is deleted remove all Cloudflare assets
+				$this->addHookBefore('Pages::delete', $this, 'hookPagesDelete');
+
+				// When a file is removed, -Cloudflare
 				$this->addHookAfter('Pagefiles::delete', $this, 'hookPagefilesDelete');
 			}
 		}
 	}
 
 	/**
-	 * Hook Pagefile::hookPagefileGetLocal()
+	 * Send a request to the Cloudflare API
 	 *
-	 * @param HookEvent $event
-	 * @return $this
+	 * @param string $endpoint
+	 * @param array|string $data
+	 * @param string $method
+	 * @param bool $logErrors
+	 * @return array
 	 *
 	 */
-	public function hookPagefileGetLocal(HookEvent $event) {
-		$event->object->set($this->className, false);
-		$event->return = $event->object;
+	public function apiRequest($endpoint = '', $data = [], $method = 'POST', $logErrors = true) {
+
+		$profiler = $this->profilerStart('apiRequest');
+
+		$http = $this->wire(new WireHttp());
+
+		if($endpoint) {
+			$endpoint = "accounts/{$this->accountId}/$endpoint";
+		} else {
+			$endpoint = 'user/tokens/verify';
+			$method = 'GET';
+		}
+
+		$contentType = 'application/json';
+		if(!is_array($data)) {
+			$contentType = 'multipart/form-data; boundary=' . self::formDataBoundary;
+		} else if(count($data)) {
+			$data = json_encode($data);
+		}
+
+		$response = $http
+			->setTimeout(20)
+			->setHeaders([
+				'Authorization' => "Bearer {$this->accessToken}",
+				'Content-Type' => $contentType,
+			])
+			->send(
+				"https://api.cloudflare.com/client/v4/$endpoint",
+				$data,
+				$method,
+				['use' => 'curl']
+			);
+
+		$response = $response ? (json_decode($response, 1) ?? [$response]) : [];
+		if(!($response['success'] ?? false) && $logErrors) {
+			$this->log(json_encode($response));
+		}
+
+		$this->profilerStop($profiler);
+
+		return $response;
 	}
 
 	/**
 	 * Hook Pagefile::url()
+	 *
+	 * Output the Cloudflare URL (if enabled)
 	 *
 	 * @param HookEvent $event
 	 * @return string
@@ -203,7 +268,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		$pagefile = $event->object;
 		$uid = $this->uid($pagefile);
 
-		if($uid && ($pagefile->get($this->className) ?? true)) {
+		if($uid && !$this->getLocal) {
 
 			$url = $this->domain;
 			if(strpos($url, '://') === false) {
@@ -216,9 +281,16 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				if(!$pagefile->original || $pagefile === $pagefile->original) {
 					$variant = 'public';
 				} else {
-					$v = $this->variant($pagefile);
+					$v = $this->uidVariant($pagefile);
 					if($v) {
 						$variant = $v;
+						if($this->isImageVariant($variant)) {
+							$variant = $this->getImageVariantName($variant);
+						} else {
+							// The variant was uploaded directly
+							$uid = $variant;
+							$variant = 'public';
+						}
 					} else {
 						// The Cloudflare variant does not exist or is not stored for this image
 						// We will remove the variation image so that it is regenerated next time
@@ -242,8 +314,25 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				}
 
 			} else if($this->useStream($pagefile)) {
+
+				// Get/set the video dimensions if they are not already set
+				$filedata = $pagefile->filedata();
+				$width = $filedata['width'] ?? -1;
+				$height = $filedata['height'] ?? -1;
+				if($width < 0 || $height < 0) {
+					$response = $this->apiRequest("stream/$uid", [], 'GET');
+					$pagefile->page->of(false);
+					foreach($response['result']['input'] ?? [] as $key => $value) {
+						$pagefile->filedata($key, $value);
+					}
+					$this->saveQuietly($pagefile);
+				}
+
 				$url = "https://{$this->customerSubdomain}/$uid/iframe";
+
+
 			} else {
+
 				$url .= "/$uid";
 			}
 
@@ -257,6 +346,9 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Hook Pagefile::httpUrl()
 	 *
+	 * Output the Cloudflare URL (if enabled)
+	 * url() and httpUrl() are the same as the Cloudflare URL is not local
+	 *
 	 * @param HookEvent $event
 	 * @return string
 	 *
@@ -264,10 +356,45 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public function hookPagefileHttpUrl(HookEvent $event) {
 		$pagefile = $event->object;
 		$uid = $this->uid($pagefile);
-		if($uid && ($pagefile->get($this->className) ?? true)) {
-			$event->replace = true;
-			$event->return = $event->object->url();
+		if($uid && !$this->getLocal) {
+			$url = $event->object->url();
+			if(strpos($url, '://') !== false) {
+				$event->replace = true;
+				$event->return = $url;
+			}
 		}
+	}
+
+	/**
+	 * Hook Pagefile::hookPagefileLocalUrl()
+	 *
+	 * Return the local URL of the asset
+	 *
+	 * @param HookEvent $event
+	 * @return $this
+	 *
+	 */
+	public function hookPagefileLocalUrl(HookEvent $event) {
+		$this->set('getLocal', true);
+		$url = $event->object->url;
+		$this->set('getLocal', $this->onlyUploads);
+		$event->return = $url;
+	}
+
+	/**
+	 * Hook Pagefile::hookPagefileLocalHttpUrl()
+	 *
+	 * Return the full local URL of the asset
+	 *
+	 * @param HookEvent $event
+	 * @return $this
+	 *
+	 */
+	public function hookPagefileLocalHttpUrl(HookEvent $event) {
+		$this->set('getLocal', true);
+		$httpUrl = $event->object->httpUrl;
+		$this->set('getLocal', $this->onlyUploads);
+		$event->return = $httpUrl;
 	}
 
 	/**
@@ -358,6 +485,10 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Hook InputfieldFile::render
 	 *
+	 * When a file input is rendered, check file availability.
+	 * If the file does not exist locally, get it from R2.
+	 * If the file exists locally but not remotely, add it to R2
+	 *
 	 * @param HookEvent $event
 	 * @return string
 	 *
@@ -373,7 +504,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				$hasLocalFile = file_exists($localFile);
 				$hasRemoteFile = file_exists($remoteFile);
 
-				if($hasLocalFile && !$hasRemoteFile) {
+				if(!$this->uid($pagefile) || ($hasLocalFile && !$hasRemoteFile)) {
 
 					// Add the file to Cloudflare
 					$this->addToCloudflare($pagefile);
@@ -391,32 +522,62 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
+	 * Hook Pages::cloned
+	 *
+	 * When a page is cloned, add all file assets to Cloudflare
+	 *
+	 * @param HookEvent $event
+	 *
+	 */
+	public function hookPagesCloned(HookEvent $event) {
+		foreach($event->arguments('copy')->getFields() as $field) {
+			if($field->type instanceof FieldtypeFile) {
+				foreach($page->get($field->name) as $pagefile) {
+					// Remove the existing key from the filedata
+					// Add the assets to Cloudflare and save the filedata
+					$pagefile->page->of(false);
+					$pagefile->filedata(null, $cf->className);
+					$this->addToCloudflare($pagefile);
+					$this->saveQuietly($pagefile);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Hook Pages::delete
+	 *
+	 * When a page is deleted, remove all file assets from Cloudflare
+	 *
+	 * @param HookEvent $event
+	 *
+	 */
+	public function hookPagesDelete(HookEvent $event) {
+
+		$page = $event->arguments('page');
+
+		$of = $page->of();
+		$page->of(false);
+		foreach($page->getFields() as $field) {
+			if($field->type instanceof FieldtypeFile) {
+				foreach($page->get($field->name) as $pagefile) {
+					$this->removeFromCloudflare($pagefile);
+				}
+			}
+		}
+		$page->of($of);
+	}
+
+	/**
 	 * Hook Pagefiles::delete
 	 *
 	 * When a file is deleted, remove it from Cloudflare
 	 *
 	 * @param HookEvent $event
-	 * @return string
 	 *
 	 */
 	public function hookPagefilesDelete(HookEvent $event) {
-
-		$pagefile = $event->arguments(0);
-		$uid = $this->uid($pagefile);
-
-		if($uid) {
-
-			$endpoint = $this->useImages($pagefile) ? 'images/v1' : ($this->useStream($pagefile) ? 'stream' : '');
-			if($endpoint) {
-				$response = $this->apiRequest(
-					"$endpoint/$uid",
-					[],
-					'DELETE'
-				);
-			}
-
-			unlink($pagefile->r2Path);
-		}
+		$this->removeFromCloudflare($event->arguments(0));
 	}
 
 	/**
@@ -431,381 +592,421 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		$pageimage = $event->arguments(0);
 		$data = $event->arguments(1);
 
-		if($this->useImages($pageimage) && $this->uid($pageimage)) {
+		if($this->useImages($pageimage) && $this->uid($pageimage) && !$this->uidVariant($pageimage)) {
 
-			$cache = $this->wire()->cache;
-			$config = $this->wire()->config;
+			$profiler = $this->profilerStart('createdVariation');
 
-			$width = $data['width'];
-			$height = $data['height'];
+			$page = $this->wire()->pages->get($pageimage->page->id);
+
 			$options = $data['options'];
-
-			// is set and is int
-			$_issetInt = function($a, $b) {
-				return isset($a[$b]) && is_int($a[$b]);
-			};
-
-			// is center
-			$_isCenter = function($x, $y) {
-				return $x === 0.5 && $y === 0.5;
-			};
-
-			// Cloudflare Image settings
-			$cfVariantOptions = [
-				'fit' => !$width || !$height ?
-					'contain' :
-					($options['upscaling'] ?? true ? // PW default is true
-						'cover' :
-						'crop'
-					),
-			];
-
-			if($width) {
-				$cfVariantOptions['width'] = $width;
+			$dryRun = $options['dryRun'] ?? false;
+			if($dryRun) {
+				$dryRun = "{$this->className}_{$pageimage->basename}";
 			}
 
-			if($height) {
-				$cfVariantOptions['height'] = $height;
-			}
+			// For the Cloudflare variant to be created/used
+			// The cfImageVariant must be passed as true in the size options
 
-			// Focus point -> Gravity
-			$focus = $pageimage->focus();
-			if($focus) {
-				$x = (float) $focus['left'] / 100;
-				$y = (float) $focus['top'] / 100;
-				if(!$_isCenter($x, $y)) {
-					$cfVariantOptions['gravity'] = [
-						'x' => $x,
-						'y' => $y,
-					];
+			if($options['cfImageVariant'] ?? false) {
+
+				// Create a Cloudflare Variant
+
+				$cache = $this->wire()->cache;
+				$config = $this->wire()->config;
+
+				$width = $data['width'];
+				$height = $data['height'];
+
+
+				// is set and is int
+				$_issetInt = function($a, $b) {
+					return isset($a[$b]) && is_int($a[$b]);
+				};
+
+				// is center
+				$_isCenter = function($x, $y) {
+					return $x === 0.5 && $y === 0.5;
+				};
+
+				// Cloudflare Image settings
+				$cfVariantOptions = [
+					'fit' => !$width || !$height ?
+						'contain' :
+						($options['upscaling'] ?? true ? // PW default is true
+							'cover' :
+							'crop'
+						),
+				];
+
+				if($width) {
+					$cfVariantOptions['width'] = $width;
 				}
-			}
 
-			// Cropping
-			if(isset($options['cropping'])) {
-				if(
-					(is_bool($options['cropping']) && !$options['cropping']) ||
-					(is_string($options['cropping']) && empty($options['cropping']))
-				) {
+				if($height) {
+					$cfVariantOptions['height'] = $height;
+				}
 
-					// No cropping
-					$cfVariantOptions['fit'] = 'scale-down';
-
-				} else if(is_string($options['cropping'])) {
-
-					// Convert string crop to xy
-					$x = 0.5;
-					$y = 0.5;
-					switch($options['cropping']) {
-						case 'north':
-						case 'n':
-							$y = 0;
-							break;
-						case 'northwest':
-						case 'nw':
-							$x = 0;
-							$y = 0;
-							break;
-						case 'northeast':
-						case 'ne':
-							$x = 1;
-							$y = 0;
-							break;
-						case 'south':
-						case 's':
-							$y = 1;
-							break;
-						case 'southwest':
-						case 'sw':
-							$x = 0;
-							$y = 1;
-							break;
-						case 'southeast':
-						case 'se':
-							$x = 1;
-							$y = 1;
-							break;
-						case 'west':
-						case 'w':
-							$x = 0;
-							break;
-						case 'east':
-						case 'e':
-							$x = 1;
-							break;
-					}
-
+				// Focus point not used
+				/*// Focus point -> Gravity
+				$focus = $pageimage->focus();
+				if($focus) {
+					$x = (float) $focus['left'] / 100;
+					$y = (float) $focus['top'] / 100;
 					if(!$_isCenter($x, $y)) {
 						$cfVariantOptions['gravity'] = [
 							'x' => $x,
 							'y' => $y,
 						];
 					}
-				}
-			}
+				}*/
 
-			if(
-				// gravity passed directly as an option
-				isset($options['gravity']) &&
-				(
-					(
-						// is a valid string value
-						is_string($options['gravity']) &&
-						in_array($options['gravity'], [
-							'auto',
-							'left',
-							'right',
-							'top',
-							'bottom',
-						])
-					) ||
-					(
-						// or is a valid xy value and not center
-						is_array($options['gravity']) &&
-						($_issetInt($options['gravity'], 'x') && $options['gravity']['x'] <= 1) &&
-						($_issetInt($options['gravity'], 'y') && $options['gravity']['y'] <= 1) &&
-						!$_isCenter($options['gravity']['x'], $options['gravity']['y'])
-					)
-				)
-			) {
-				$cfVariantOptions['gravity'] = $options['gravity'];
-			}
+				// Cropping
+				if(isset($options['cropping'])) {
+					if(
+						(is_bool($options['cropping']) && !$options['cropping']) ||
+						(is_string($options['cropping']) && empty($options['cropping']))
+					) {
 
-			// HiDPI -> DPR
-			if($options['hidpi'] ?? false) {
-				$options['dpr'] = 2;
-				$options['fit'] = 'cover';
-				/*
-				// For the future perhaps
-				// ERROR 5400: Bad request: Variant options do not allow quality
-				if(isset($options['hidpiQuality'])) {
-					$options['quality'] = $options['hidpiQuality'];
-				}
-				*/
-			}
+						// No cropping
+						$cfVariantOptions['fit'] = 'scale-down';
 
-			// Sharpening -> Sharpen
-			if($options['sharpening'] ?? '') {
-				$options['sharpen'] = [
-					'none' => 0,
-					'soft' => 0.25,
-					'medium' => 0.5,
-					'strong' => 0.8,
-				][$options['sharpening']] ?? 0.25; // PW default is soft
-			}
+					} else if(is_string($options['cropping'])) {
 
-			// We also need to generate a variant name
-			// There's a limit of 100 alphanumeric chars
-			// and we also want it to be readable/understandable
-			// e.g. we can tell what the variant is doing
-			$cfVariantName = [];
+						// Convert string crop to xy
+						$x = 0.5;
+						$y = 0.5;
+						switch($options['cropping']) {
+							case 'north':
+							case 'n':
+								$y = 0;
+								break;
+							case 'northwest':
+							case 'nw':
+								$x = 0;
+								$y = 0;
+								break;
+							case 'northeast':
+							case 'ne':
+								$x = 1;
+								$y = 0;
+								break;
+							case 'south':
+							case 's':
+								$y = 1;
+								break;
+							case 'southwest':
+							case 'sw':
+								$x = 0;
+								$y = 1;
+								break;
+							case 'southeast':
+							case 'se':
+								$x = 1;
+								$y = 1;
+								break;
+							case 'west':
+							case 'w':
+								$x = 0;
+								break;
+							case 'east':
+							case 'e':
+								$x = 1;
+								break;
+						}
 
-			// Convert array or possible values to a string for the variant name
-			$_a2s = function($a, $b = false) {
-				if(is_array($a)) {
-					$s = '';
-					if($b) {
-						return json_encode($a);
-					} else {
-						foreach($a as $k => $v) {
-							$s .= substr($k, 0, 1) . $v;
+						if(!$_isCenter($x, $y)) {
+							$cfVariantOptions['gravity'] = [
+								'x' => $x,
+								'y' => $y,
+							];
 						}
 					}
-					return $s;
 				}
-				return $a;
-			};
 
-			// Bool values
-			if(isset($options['anim'])) {
-				$cfVariantOptions['anim'] = (bool) $options['anim'];
-				$cfVariantName['an'] = (int) $options['anim'];
-			}
+				if(
+					// gravity passed directly as an option
+					isset($options['gravity']) &&
+					(
+						(
+							// is a valid string value
+							is_string($options['gravity']) &&
+							in_array($options['gravity'], [
+								'auto',
+								'left',
+								'right',
+								'top',
+								'bottom',
+							])
+						) ||
+						(
+							// or is a valid xy value and not center
+							is_array($options['gravity']) &&
+							($_issetInt($options['gravity'], 'x') && $options['gravity']['x'] <= 1) &&
+							($_issetInt($options['gravity'], 'y') && $options['gravity']['y'] <= 1) &&
+							!$_isCenter($options['gravity']['x'], $options['gravity']['y'])
+						)
+					)
+				) {
+					$cfVariantOptions['gravity'] = $options['gravity'];
+				}
 
-			// Integer values
-			foreach([
-				'blur',
-				'dpr',
-				'height',
-				//'quality',
-				'rotate',
-				'width',
-			] as $key) {
-				if(isset($options[$key])) {
-					$value = (int) $options[$key];
-					if($value) {
-						$cfVariantOptions[$key] = $value;
-						if(!in_array($key, ['width', 'height'])) {
+				// HiDPI -> DPR
+				if($options['hidpi'] ?? false) {
+					$options['dpr'] = 2;
+					$options['fit'] = 'cover';
+					/*
+					// For the future perhaps
+					// ERROR 5400: Bad request: Variant options do not allow quality
+					if(isset($options['hidpiQuality'])) {
+						$options['quality'] = $options['hidpiQuality'];
+					}
+					*/
+				}
+
+				// Sharpening -> Sharpen
+				if($options['sharpening'] ?? '') {
+					$options['sharpen'] = [
+						'none' => 0,
+						'soft' => 0.25,
+						'medium' => 0.5,
+						'strong' => 0.8,
+					][$options['sharpening']] ?? 0.25; // PW default is soft
+				}
+
+				// We also need to generate a variant name
+				// There's a limit of 100 alphanumeric chars
+				// and we also want it to be readable/understandable
+				// e.g. we can tell what the variant is doing
+				$cfVariantName = [];
+
+				// Convert array or possible values to a string for the variant name
+				$_a2s = function($a, $b = false) {
+					if(is_array($a)) {
+						$s = '';
+						if($b) {
+							return json_encode($a);
+						} else {
+							foreach($a as $k => $v) {
+								$s .= substr($k, 0, 1) . $v;
+							}
+						}
+						return $s;
+					}
+					return $a;
+				};
+
+				// Bool values
+				if(isset($options['anim'])) {
+					$cfVariantOptions['anim'] = (bool) $options['anim'];
+					$cfVariantName['an'] = (int) $options['anim'];
+				}
+
+				// Integer values
+				foreach([
+					'blur',
+					'dpr',
+					'height',
+					//'quality',
+					'rotate',
+					'width',
+				] as $key) {
+					if(isset($options[$key])) {
+						$value = (int) $options[$key];
+						if($value) {
+							$cfVariantOptions[$key] = $value;
+							if(!in_array($key, ['width', 'height'])) {
+								$cfVariantName[$key] = $value;
+							}
+						}
+					}
+				}
+
+				// Float values
+				foreach([
+					'brightness',
+					'contrast',
+					'gamma',
+					'sharpen',
+				] as $key) {
+					if(isset($options[$key])) {
+						$value = (float) $options[$key];
+						if($value) {
+							$max = $key === 'sharpen' ? 10 : 2;
+							if($value > $max) {
+								$value = $max;
+							}
+							$cfVariantOptions[$key] = $value;
 							$cfVariantName[$key] = $value;
 						}
 					}
 				}
-			}
 
-			// Float values
-			foreach([
-				'brightness',
-				'contrast',
-				'gamma',
-				'sharpen',
-			] as $key) {
-				if(isset($options[$key])) {
-					$value = (float) $options[$key];
-					if($value) {
-						$max = $key === 'sharpen' ? 10 : 2;
-						if($value > $max) {
-							$value = $max;
-						}
-						$cfVariantOptions[$key] = $value;
-						$cfVariantName[$key] = $value;
-					}
-				}
-			}
-
-			// String values
-			foreach([
-				'background',
-				'fit',
-				'metadata',
-			] as $key) {
-				if(isset($options[$key])) {
-					$value = (string) $options[$key];
-					if($value) {
-						$cfVariantOptions[$key] = $value;
-						if($key !== 'fit') {
-							$cfVariantName[$key] = $value;
+				// String values
+				foreach([
+					'background',
+					'fit',
+					'metadata',
+				] as $key) {
+					if(isset($options[$key])) {
+						$value = (string) $options[$key];
+						if($value) {
+							$cfVariantOptions[$key] = $value;
+							if($key !== 'fit') {
+								$cfVariantName[$key] = $value;
+							}
 						}
 					}
 				}
-			}
 
-			// Border
-			if(
-				isset($options['border']) &&
-				is_array($options['border']) &&
-				isset($options['border']['color']) &&
-				is_string($options['border']['color']) &&
-				(
-					$_issetInt($options['border'], 'width') ||
+				// Border
+				if(
+					isset($options['border']) &&
+					is_array($options['border']) &&
+					isset($options['border']['color']) &&
+					is_string($options['border']['color']) &&
 					(
-						$_issetInt($options['border'], 'top') &&
-						$_issetInt($options['border'], 'right') &&
-						$_issetInt($options['border'], 'bottom') &&
-						$_issetInt($options['border'], 'left')
+						$_issetInt($options['border'], 'width') ||
+						(
+							$_issetInt($options['border'], 'top') &&
+							$_issetInt($options['border'], 'right') &&
+							$_issetInt($options['border'], 'bottom') &&
+							$_issetInt($options['border'], 'left')
+						)
 					)
-				)
-			) {
-				$cfVariantOptions['border'] = $options['border'];
-				$cfVariantName['bo'] = $_a2s($options['border']);
-			}
+				) {
+					$cfVariantOptions['border'] = $options['border'];
+					$cfVariantName['bo'] = $_a2s($options['border']);
+				}
 
-			// Trim
-			if(
-				isset($options['trim']) &&
-				$_issetInt($options['trim'], 'top') &&
-				$_issetInt($options['trim'], 'right') &&
-				$_issetInt($options['trim'], 'bottom') &&
-				$_issetInt($options['trim'], 'left')
-			) {
-				$cfVariantOptions['trim'] = $options['trim'];
-				$cfVariantName['tr'] = $_a2s($options['trim']);
-			}
+				// Trim
+				if(
+					isset($options['trim']) &&
+					$_issetInt($options['trim'], 'top') &&
+					$_issetInt($options['trim'], 'right') &&
+					$_issetInt($options['trim'], 'bottom') &&
+					$_issetInt($options['trim'], 'left')
+				) {
+					$cfVariantOptions['trim'] = $options['trim'];
+					$cfVariantName['tr'] = $_a2s($options['trim']);
+				}
 
-			// Let's generate the actual variant name
-			// e.g. w100h100con
-			$cfVariant = 'w' . ($_issetInt($options, 'nameWidth') ? $options['nameWidth'] : ($cfVariantOptions['width'] ?? 0)) .
-				'h' . ($_issetInt($options, 'nameHeight') ? $options['nameHeight'] : ($cfVariantOptions['height'] ?? 0)) .
-				substr($cfVariantOptions['fit'], 0, 3);
+				// Let's generate the actual variant name
+				// e.g. w100h100con
+				$cfVariant = 'w' . ($_issetInt($options, 'nameWidth') ? $options['nameWidth'] : ($cfVariantOptions['width'] ?? 0)) .
+					'h' . ($_issetInt($options, 'nameHeight') ? $options['nameHeight'] : ($cfVariantOptions['height'] ?? 0)) .
+					substr($cfVariantOptions['fit'], 0, 3);
 
-			// e.g. x1y0
-			if(isset($cfVariantOptions['gravity'])) {
-				$cfVariant .= $_a2s($cfVariantOptions['gravity'], true);
-			}
+				// e.g. x1y0
+				if(isset($cfVariantOptions['gravity'])) {
+					$cfVariant .= $_a2s($cfVariantOptions['gravity'], true);
+				}
 
-			// e.g. br1sh2
-			foreach($cfVariantName as $key => $value) {
-				$cfVariant .= substr($key, 0, 2) . $value;
-			}
+				// e.g. br1sh2
+				foreach($cfVariantName as $key => $value) {
+					$cfVariant .= substr($key, 0, 2) . $value;
+				}
 
-			// e.g. srcset
-			if(isset($options['suffix']) && !empty($options['suffix'])) {
-				$cfVariant .= $_a2s($options['suffix'], true);
-			}
+				// e.g. srcset
+				if(isset($options['suffix']) && !empty($options['suffix'])) {
+					$cfVariant .= $_a2s($options['suffix'], true);
+				}
 
-			// The variant name must be alphanumeric and no longer than 100 chars
-			$cfVariant = substr($this->wire()->sanitizer->alphanumeric($cfVariant), 0, 100);
+				// The variant name must be alphanumeric and no longer than 100 chars
+				$cfVariant = substr($this->wire()->sanitizer->alphanumeric($cfVariant), 0, 100);
+				$uidVariant = self::imageVariantPrefix . $cfVariant;
 
-			$endpoint = 'images/v1/variants';
+				// Get the variant usage
+				$usage = $this->getUsageStatistics();
 
-			// Get the current variants
-			// Cache the result for a day
-			$cfVariants = $cache->getFor($this, $endpoint, 'daily', function() use ($endpoint) {
-				$response = $this->apiRequest(
-					$endpoint,
-					[],
-					'GET',
-					false
-				);
-				return array_keys($response['result']['variants'] ?? []);
-			});
+				// If the number of variants is approaching the maximum (4/5 used), notify the admin
+				$maxVariants = self::maxVariants;
+				$numVariants = $usage['variantsCount'];
+				if($numVariants / $maxVariants > 0.8) {
 
-			// If the number of variants is approaching the maximum (4/5 used), notify the admin
-			$maxVariants = self::maxVariants;
-			$numVariants = count($cfVariants);
-			if($numVariants / $maxVariants > 0.8) {
+					$cache->getFor($this, 'totalVariantsNotifyAdmin', 'daily', function() use ($config, $maxVariants, $numVariants) {
 
-				$cache->getFor($this, 'totalVariantsNotifyAdmin', 'daily', function() use ($config, $maxVariants, $numVariants) {
+						$warning = sprintf(
+							$this->_('The number of variants you have used (%1$d) is approaching the maximum of %2$d.'),
+							$numVariants,
+							$maxVariants
+						);
 
-					$warning = sprintf(
-						$this->_('The number of variants you have used (%1$d) is approaching the maximum of %2$d.'),
-						$numVariants,
-						$maxVariants
+						$this->log($warning);
+
+						$adminEmail = $config->adminEmail;
+						if($adminEmail) {
+							$this->wire()->mail->new()
+								->to($adminEmail)
+								->subject(sprintf($this->_('%1$s on %2$s'), $this->className, $config->httpHost))
+								->body($warning)
+								->send();
+							return 2; // logged and email sent
+						}
+
+						return 1; // only logged
+					});
+				}
+
+				if($dryRun) {
+
+					// Log the expected result
+
+					if(!in_array($cfVariant, $usage['variants'])) {
+						$this->log(sprintf($this->_('Dry run: the image would create a Cloudflare Images Variant named `%s`'), $cfVariant));
+					}
+
+					$this->log(sprintf($this->_('Dry run: the image would use a Cloudflare Images Variant named `%1$s` with the filedata key `%2$s`'), $cfVariant, "$dryRun: $uidVariant"));
+					$uidVariant = null;
+
+				} else if(!in_array($cfVariant, $usage['variants'])) {
+
+					// If the variant does not exist
+					// Create the variant
+					$response = $this->apiRequest(
+						'images/v1/variants',
+						[
+							'id' => $cfVariant,
+							'options' => $cfVariantOptions,
+						],
 					);
+					$this->resetUsage('variants');
+				}
 
-					$this->log($warning);
+			} else if($dryRun) {
 
-					$adminEmail = $config->adminEmail;
-					if($adminEmail) {
-						$this->wire()->mail->new()
-							->to($adminEmail)
-							->subject(sprintf($this->_('%1$s on %2$s'), $this->className, $config->httpHost))
-							->body($warning)
-							->send();
-						return 2; // logged and email sent
-					}
+				// Log the expected result
+				$this->log(sprintf($this->_('Dry run: an image variation would be uploaded with the filedata key `%s`'), "$dryRun: {CFUID}"));
 
-					return 1; // only logged
-				});
-			}
+			} else {
 
-			// If the variant does not exist
-			if(!in_array($cfVariant, $cfVariants)) {
-				// Create the variant
-				$response = $this->apiRequest(
-					$endpoint,
-					[
-						'id' => $cfVariant,
-						'options' => $cfVariantOptions,
-					],
-				);
-				// Add it to our cache
-				$cfVariants[] = $cfVariant;
-				$cache->saveFor($this, $endpoint, $cfVariants, 'daily');
-			}
-
-			// We need to add the variant to the filedata of the original
-			// and the clone so it is available immediately
-			$page = $this->wire()->pages->get($pageimage->page->id);
-			$page->of(false);
-			$pagefiles = $page->get($pageimage->field->name);
-			foreach($pagefiles as $pagefile) {
-				if($pagefile->basename === $pageimage->original->basename) {
-					$this->variant($pageimage, $pageimage->basename, $cfVariant);
-					$this->variant($pagefile, $pageimage->basename, $cfVariant);
-					$this->saveQuietly($pagefile);
+				// Upload as a new image
+				$uid = $this->addImageToCloudflare($pageimage);
+				if($uid) {
+					$uidVariant = $uid;
+				} else {
+					$this->log(sprintf($this->_('Could not upload %s. Please remove and try again.'), $pageimage->basename));
 				}
 			}
-			$page->of(true);
+
+			if($uidVariant ?? '') {
+				// We need to add the variant to the filedata of the original
+				// and to the clone so it is available immediately
+				$of = $page->of();
+				$page->of(false);
+				foreach($page->get($pageimage->field->name) as $pagefile) {
+					if($pagefile->basename === $pageimage->original->basename) {
+						$pagefile->page->of(false);
+						$this->uidVariant($pagefile, $pageimage->basename, $uidVariant);
+						$this->saveQuietly($pagefile);
+						$pageimage->filedata($pagefile->filedata());
+					}
+				}
+				$page->of($of);
+
+				$this->resetUsage('images');
+			}
+
+			$this->profilerStop($profiler);
 		}
 	}
 
@@ -825,18 +1026,16 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			$r2Only = false;
 			if($this->useImages($pagefile)) {
 
-				$boundary = '--' . self::formDataBoundary;
-				$response = $this->apiRequest(
-					'images/v1',
-					"$boundary\r\n" .
-					"Content-Disposition: form-data; name=\"url\"\r\n\r\n$pagefile->httpUrl\r\n" .
-					"$boundary--\r\n\r\n"
-				);
+				// Add the image to Cloudflare Images
+				$uid = $this->addImageToCloudflare($pagefile);
 
-				$uid = $response['result']['id'] ?? null;
+				if($uid) { // reset usage statistics
+					$this->resetUsage('images');
+				}
 
 			} else if($this->useStream($pagefile)) {
 
+				// Add the video to Cloudflare Stream
 				$response = $this->apiRequest(
 					'stream/copy',
 					[
@@ -850,18 +1049,24 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 				$uid = $response['result']['uid'] ?? null;
 
+				if($uid) { // reset usage statistics
+					$this->resetUsage('stream');
+				}
+
 			} else {
 
+				// Just add it to R2
 				$r2Only = true;
 			}
 
-			// All files are placed in R2 via s3 client
+			// All uploaded files are placed in R2 via s3 client
 			// But we only need to set the uid if the file is only in the r2 bucket
 			if(file_put_contents($pagefile->r2Path, fopen($pagefile->filename, 'r')) && $r2Only) {
 				$uid = $pagefile->r2Key;
 			}
 
-			if(isset($uid)) {
+			// Set the uid if present
+			if($uid ?? '') {
 				$this->uid($pagefile, $uid);
 			}
 		}
@@ -895,6 +1100,8 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				$out,
 				$matches
 			)) {
+
+				$profiler = $this->profilerStart('pageRender');
 
 				$fileFields = [];
 				$replacements = [];
@@ -962,10 +1169,149 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				if(count($replacements)) {
 					$out = str_replace(array_keys($replacements), array_values($replacements), $out);
 				}
+
+				$this->profilerStop($profiler);
 			}
 
 			$event->return = $out;
 		}
+	}
+
+	/**
+	 * Get the usage statistics
+	 *
+	 * @return array
+	 *
+	 */
+	public function getUsageStatistics() {
+
+		$cache = $this->wire()->cache;
+
+		$_getRecords = function($name, $variants = false) {
+			$table = strtolower("field_$name");
+			$query = $this->wire()->database->prepare("SELECT filedata FROM $table");
+			$query->execute();
+			$records = $variants ? [] : [[], []];
+			foreach($query->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+				foreach(json_decode($row['filedata'], 1) as $key => $value) {
+					if(strpos($key, $this->className) === 0) {
+						if($variants) {
+							if($this->isImageVariant($value)) {
+								$records[] = $this->getImageVariantName($value);
+							} else if($key === $this->className) {
+								$records[] = 'public';
+							}
+						} else {
+							$records[$key === $this->className ? 0 : 1][] = $value;
+						}
+					}
+				}
+			}
+			return $records;
+		};
+
+		$images = $cache->getFor($this, 'usageImages', WireCache::expireNever, function() use ($_getRecords) {
+
+			$counts = $this->apiRequest('images/v1/stats', [], 'GET', false)['result']['count'] ?? [];
+
+			$items = [];
+			$counts['missed'] = 0;
+			$counts['duplicate'] = 0;
+			$counts['variations'] = 0;
+			foreach($this->wire()->fields->findByType('FieldtypeImage', ['valueType' => 'name', 'indexType' => '']) as $name) {
+				$records = $_getRecords($name);
+				foreach($records[0] as $uid) {
+					if($uid) {
+						if(isset($items[$uid])) {
+							$counts['duplicate']++;
+						}
+						$items[$uid] = $uid;
+					} else {
+						$counts['missed']++;
+					}
+				}
+				foreach($records[1] as $uid) {
+					if(!$this->isImageVariant($uid)) {
+						$counts['variations']++;
+					}
+				}
+			}
+
+			$counts['local'] = count($items) + $counts['missed'];
+
+			return $counts;
+		});
+
+		$variants = $cache->getFor($this, 'usageVariants', WireCache::expireNever, function() use ($_getRecords) {
+
+			$variants = [];
+			foreach(array_keys($this->apiRequest('images/v1/variants', [], 'GET', false)['result']['variants'] ?? []) as $variant) {
+				$variants[$variant] = [];
+			}
+
+			foreach($this->wire()->fields->findByType('FieldtypeImage', ['valueType' => 'name', 'indexType' => '']) as $name) {
+				foreach($_getRecords($name, true) as $variant) {
+					if(!isset($variants[$variant][$name])) {
+						$variants[$variant][$name] = 0;
+					}
+					$variants[$variant][$name]++;
+				}
+			}
+
+			return [
+				'variants' => array_keys($variants),
+				'usage' => $variants,
+			];
+		});
+
+		$stream = $cache->getFor($this, 'usageStream', WireCache::expireNever, function() use ($_getRecords) {
+
+			$counts = [];
+			$result = $this->apiRequest('stream', [], 'GET', false);
+			$counts['current'] = $result['result_info']['total_count'] ?? count($result['result'] ?? []);
+
+			$items = [];
+			$counts['missed'] = 0;
+			$counts['duplicate'] = 0;
+			foreach($this->wire()->fields->findByType('FieldtypeFile', ['valueType' => 'name', 'indexType' => '']) as $name) {
+				foreach(explode(' ', $this->wire()->fields->get($name)->extensions) as $ext) {
+					if(in_array($ext, explode(' ', self::streamExtensions))) {
+						$records = $_getRecords($name);
+						foreach($records[0] as $uid) {
+							if($uid) {
+								if(isset($items[$uid])) {
+									$counts['duplicate']++;
+								}
+								$items[$uid] = $uid;
+							} else {
+								$counts['missed']++;
+							}
+						}
+					}
+				}
+			}
+
+			$counts['local'] = count($items) + $counts['missed'];
+
+			return $counts;
+		});
+
+		return [
+			'imagesAllowed' => $images['allowed'] ?? 0,
+			'imagesCount' => $images['current'] ?? 0,
+			'imagesLocal' => $images['local'] ?? 0,
+			'imagesVariations' => $images['variations'] ?? 0,
+			'imagesDuplicate' => $images['duplicate'] ?? 0,
+			'imagesMissed' => $images['missed'] ?? 0,
+			'variants' => $variants['variants'] ?? [],
+			'variantsUsage' => $variants['usage'] ?? [],
+			'variantsAllowed' => self::maxVariants,
+			'variantsCount' => count($variants['variants'] ?? []),
+			'streamCount' => $stream['current'],
+			'streamLocal' => $stream['local'] ?? 0,
+			'streamDuplicate' => $stream['duplicate'] ?? 0,
+			'streamMissed' => $stream['missed'] ?? 0,
+		];
 	}
 
 	/**
@@ -980,52 +1326,162 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
-	 * Send to the Cloudflare API
+	 * List the images
 	 *
-	 * @param string $endpoint
-	 * @param array|string $data
-	 * @param string $method
-	 * @param bool $logErrors
-	 * @return array
+	 * @param int $pageNum
+	 * @return string
 	 *
 	 */
-	protected function apiRequest($endpoint = '', $data = [], $method = 'POST', $logErrors = true) {
+	public function listImages(int $pageNum = 1) {
+		return $this->apiRequest(
+			'images/v1?' . http_build_query([
+				'page' => $pageNum,
+				'per_page' => 10000,
+			]),
+			[],
+			'GET'
+		);
+	}
 
-		$http = $this->wire(new WireHttp());
+	/**
+	 * Remove a file from Cloudflare
+	 *
+	 * @param Pagefile $pagefile
+	 * @return string|null
+	 *
+	 */
+	protected function removeFromCloudflare(Pagefile $pagefile) {
 
-		if($endpoint) {
-			$endpoint = "accounts/{$this->accountId}/$endpoint";
-		} else {
-			$endpoint = 'user/tokens/verify';
-			$method = 'GET';
+		$uid = $this->uid($pagefile);
+		if($uid) {
+
+			$useImages = $this->useImages($pagefile);
+
+			$_delete = function($endpoint, $uid) {
+				return $this->apiRequest(
+					"$endpoint/$uid",
+					[],
+					'DELETE'
+				);
+			};
+
+			$endpoint = $useImages ? 'images/v1' : ($this->useStream($pagefile) ? 'stream' : '');
+			if($endpoint) {
+
+				// Delete the item from Images / Stream
+				$_delete($endpoint, $uid);
+
+				if($useImages) {
+					// Remove the uploaded image variants
+					foreach($pagefile->getVariations() as $pageimageVariation) {
+						$uidVariant = $this->uidVariant($pageimageVariation);
+						if($uidVariant && !$this->isImageVariant($uidVariant)) {
+							$_delete($endpoint, $uidVariant);
+						}
+					}
+				}
+			}
+
+			// Remove the item from R2
+			unlink($pagefile->r2Path);
+
+			// Update statistics
+			$this->resetUsage($endpoint);
 		}
 
-		$contentType = 'application/json';
-		if(!is_array($data)) {
-			$contentType = 'multipart/form-data; boundary=' . self::formDataBoundary;
-		} else if(count($data)) {
-			$data = json_encode($data);
+		// Remove filedata
+		$filedata = $pagefile->filedata();
+		foreach($filedata as $key => $value) {
+			if(strpos($key, $this->className) === 0) {
+				$pagefile->filedata(null, $key);
+			}
 		}
 
-		$response = $http
-			->setTimeout(20)
-			->setHeaders([
-				'Authorization' => "Bearer {$this->accessToken}",
-				'Content-Type' => $contentType,
-			])
-			->send(
-				"https://api.cloudflare.com/client/v4/$endpoint",
-				$data,
-				$method,
-				['use' => 'curl']
-			);
+		return $uid;
+	}
 
-		$response = $response ? (json_decode($response, 1) ?? [$response]) : [];
-		if(!($response['success'] ?? false) && $logErrors) {
-			$this->log(json_encode($response));
-		}
+	/**
+	 * Add the image to Cloudflare
+	 *
+	 * @param Pageimage $pageimage
+	 * @return string|null
+	 *
+	 */
+	protected function addImageToCloudflare(Pageimage $pageimage) {
 
-		return $response;
+		$boundary = '--' . self::formDataBoundary;
+		$response = $this->apiRequest(
+			'images/v1',
+			"$boundary\r\n" .
+			"Content-Disposition: form-data; name=\"url\"\r\n\r\n{$pageimage->localHttpUrl}\r\n" .
+			"$boundary--\r\n\r\n"
+		);
+
+		return $response['result']['id'] ?? null;
+	}
+
+	/**
+	 * Get the image variant name
+	 *
+	 * Remove the prefix
+	 *
+	 * @param string $variant
+	 * @return bool
+	 *
+	 */
+	protected function getImageVariantName($variant) {
+		return str_replace(self::imageVariantPrefix, '', $variant);
+	}
+
+	/**
+	 * Is this variant name an image variant?
+	 *
+	 * @param string $variant
+	 * @return bool
+	 *
+	 */
+	protected function isImageVariant($variant) {
+		return substr($variant, 0, strlen(self::imageVariantPrefix)) === self::imageVariantPrefix;
+	}
+
+	/**
+	 * Start a ProfilerPro timer
+	 *
+	 * #pw-group-utility
+	 *
+	 * @param string $name Name of your event.
+	 * @return array|null Event to be used for stop call.
+	 *
+	 */
+	protected function profilerStart($name) {
+		return $name && $this->wire()->profiler ? $this->wire()->profiler->start("{$this->className}::$name") : null;
+	}
+
+	/**
+	 * Stop a ProfilerPro timer
+	 *
+	 * #pw-group-utility
+	 *
+	 * @param array|object|string|null $event The event returned from the $profiler->start() method.
+	 * @return float Returns elapsed time since the start() call.
+	 *
+	 */
+	protected function profilerStop($event) {
+		return $event && $this->wire()->profiler ? $this->wire()->profiler->stop($event) : 0;
+	}
+
+	/**
+	 * Reset usage
+	 *
+	 * @param string $key
+	 * @return int
+	 *
+	 */
+	protected function resetUsage($key) {
+		// Remove cached usage stats
+		$this->wire()->cache->deleteFor($this, 'usage' . ucfirst(explode('/', $key)[0]));
+		// Get them again
+		return $this->getUsageStatistics()["{$key}Count"] ?? 0;
 	}
 
 	/**
@@ -1067,7 +1523,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 * @see Pagefile::filedata()
 	 *
 	 */
-	protected function variant(Pageimage $pageimage, $basename = '', $value = null) {
+	protected function uidVariant(Pageimage $pageimage, $basename = '', $value = null) {
 		if(empty($basename)) $basename = $pageimage->basename;
 		return $pageimage->filedata("{$this->className}_{$basename}", $value);
 	}
