@@ -244,6 +244,9 @@ class CloudflareAssetsConfig extends ModuleConfig {
 					$keys[$field] = ($keys[$field] ?? 0) + $count;
 					$value[$field] = $count;
 				}
+				if(!in_array($variant, $usage['variants'])) {
+					$variant = "<strike title='{$this->_('This variant does not exist in your Cloudflare Account')}'>$variant</strike>";
+				}
 				$values[$variant] = $value;
 			}
 
@@ -291,6 +294,17 @@ class CloudflareAssetsConfig extends ModuleConfig {
 
 		$inputfields->add([
 			'type' => 'checkbox',
+			'name' => '_clearStats',
+			'value' => 0,
+			'label' => $this->_('Clear the cached statistics?'),
+			'checkboxLabel' => $this->_('Clear and regenerate'),
+			'description' => $this->_('If you have deleted assets in the Cloudflare admin, check this box and click Submit to regenerate usage stats.'),
+			'icon' => 'refresh',
+			'collapsed' => 2,
+		]);
+
+		$inputfields->add([
+			'type' => 'checkbox',
 			'name' => 'onlyUploads',
 			'value' => $this->onlyUploads,
 			'label' => $this->_('Only Uploads?'),
@@ -298,17 +312,6 @@ class CloudflareAssetsConfig extends ModuleConfig {
 			'description' => $this->_('If this is enabled, assets will continue to be uploaded to Cloudflare if authorised by the details entered above, but will be served by the local filesystem.'),
 			'notes' => $this->_('If you encounter a problem with your Cloudflare setup, this option allows you to revert to the default without completely removing the integration.'),
 			'icon' => 'cloud-upload',
-			'collapsed' => 2,
-		]);
-
-		$inputfields->add([
-			'type' => 'checkbox',
-			'name' => '_clearStats',
-			'value' => 0,
-			'label' => $this->_('Clear the cached statistics?'),
-			'checkboxLabel' => $this->_('Clear and regenerate'),
-			'description' => $this->_('If you have deleted assets in the Cloudflare admin, check this box and click Submit to regenerate usage stats.'),
-			'icon' => 'refresh',
 			'collapsed' => 2,
 		]);
 
