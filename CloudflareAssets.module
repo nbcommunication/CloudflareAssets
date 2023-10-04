@@ -24,8 +24,6 @@
  * @property S3Client $s3
  * @property array $usage
  *
- * @todo handle image upload errors
- *
  */
 
 class CloudflareAssets extends WireData implements Module, ConfigurableModule {
@@ -39,7 +37,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'Cloudflare Assets',
-			'version' => 14,
+			'version' => 15,
 			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
@@ -78,6 +76,14 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 *
 	 */
 	protected $usage = [];
+
+	/**
+	 * Should the save hook keep running?
+	 *
+	 * @var array
+	 *
+	 */
+	protected $runSaveHook = true;
 
 	/**
 	 * Initialize the module
@@ -198,6 +204,11 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 				// When a file is uploaded +CloudFlare
 				$this->addHookAfter('PagefilesManager::save', $this, 'hookPagefilesManagerSave');
+
+				// When a page is finished being saved, set the runSaveHook property to false
+				$this->addHookAfter('Pages::save', function(HookEvent $event) {
+					$this->runSaveHook = true;
+				});
 
 				// When a file input is rendered, check file availability
 				$this->addHookBefore('InputfieldFile::render', $this, 'hookInputfieldFileRender');
@@ -345,6 +356,8 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 					$pageimageNew = clone $pageimage;
 					$pageimageNew->setFilename($pageimage->pagefiles->path() . $basename);
 					$pageimageNew->setOriginal($pageimage);
+					$pageimageNew->set('variationWidth', $width);
+					$pageimageNew->set('variationHeight', $height);
 
 					if(!$this->uidVariant($pageimage, $basename)) {
 
@@ -395,11 +408,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			$uid = $this->uid($pagefile);
 			if($uid && !$this->getLocal) {
 
-				$url = $this->domain;
-				if(strpos($url, '://') === false) {
-					$url = "https://$url";
-				}
-
+				$url = $this->getCloudflareUrl();
 				if($this->useImages($pagefile)) {
 
 					$variant = '';
@@ -567,7 +576,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	/**
 	 * Hook PagefilesManager::save
 	 *
-	 * After a file is added, add it to the appropriate Cloudflare service
+	 * After files are added, add it to the appropriate Cloudflare service
 	 *
 	 * @param HookEvent $event
 	 * @return string
@@ -575,11 +584,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 */
 	public function hookPagefilesManagerSave(HookEvent $event) {
 
-		static $saved = false;
-		if(!$saved) {
-
-			// We only want to run this once per save
-			$saved = true;
+		if($this->runSaveHook) {
 
 			$page = $event->object->page;
 			foreach($page as $value) {
@@ -627,6 +632,8 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 								$add = true;
 								if($value->field->maxFiles === 1 && $count > 1) {
 
+									$this->runSaveHook = false;
+
 									// A new file has been added to a single item field
 									if($pagefile === $value->last) {
 
@@ -639,6 +646,8 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 										$this->removeFromCloudflare($pagefile);
 										$add = false;
 									}
+								} else {
+									$this->runSaveHook = true;
 								}
 
 								// Add to Cloudflare if not already added
@@ -885,46 +894,44 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 		if(!$uid) {
 
-			$r2Only = false;
-			if($this->useImages($pagefile)) {
-
-				// Add the image to Cloudflare Images
-				$uid = $this->addImageToCloudflare($pagefile);
-
-				if($uid) { // reset usage statistics
-					$this->resetUsage('images');
-				}
-
-			} else if($this->useStream($pagefile)) {
-
-				// Add the video to Cloudflare Stream
-				$response = $this->apiRequest(
-					'stream/copy',
-					[
-						'url' => $pagefile->httpUrl,
-						'meta' => [
-							'name' => $this->getLabel($pagefile),
-						],
-						'allowedOrigins' => $this->allowedOrigins,
-					]
-				);
-
-				$uid = $response['result']['uid'] ?? null;
-
-				if($uid) { // reset usage statistics
-					$this->resetUsage('stream');
-				}
-
-			} else {
-
-				// Just add it to R2
-				$r2Only = true;
-			}
+			$r2Url = $this->getCloudflareUrl() . "/$pagefile->r2Key";
 
 			// All uploaded files are placed in R2 via s3 client
-			// But we only need to set the uid if the file is only in the r2 bucket
-			if(file_put_contents($pagefile->r2Path, fopen($pagefile->filename, 'r')) && $r2Only) {
+			if(file_put_contents($pagefile->r2Path, fopen($pagefile->filename, 'r'))) {
 				$uid = $pagefile->r2Key;
+			}
+
+			if($uid) {
+
+				if($this->useImages($pagefile)) {
+
+					// Add the image to Cloudflare Images
+					$uid = $this->addImageToCloudflare($pagefile, $r2Url);
+
+					if($uid) { // reset usage statistics
+						$this->resetUsage('images');
+					}
+
+				} else if($this->useStream($pagefile)) {
+
+					// Add the video to Cloudflare Stream
+					$response = $this->apiRequest(
+						'stream/copy',
+						[
+							'url' => $r2Url,
+							'meta' => [
+								'name' => $this->getLabel($pagefile),
+							],
+							'allowedOrigins' => $this->allowedOrigins,
+						]
+					);
+
+					$uid = $response['result']['uid'] ?? null;
+
+					if($uid) { // reset usage statistics
+						$this->resetUsage('stream');
+					}
+				}
 			}
 
 			// Set the uid if present
@@ -1351,6 +1358,20 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
+	 * Get the Cloudflare URL
+	 *
+	 * @return string
+	 *
+	 */
+	public function getCloudflareUrl() {
+		$url = $this->domain;
+		if(strpos($url, '://') === false) {
+			$url = "https://$url";
+		}
+		return $url;
+	}
+
+	/**
 	 * Get the usage statistics
 	 *
 	 * @return array
@@ -1577,6 +1598,30 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
+	 * Should Cloudflare Images be used for the Pagefile?
+	 *
+	 * @param Pagefile $pagefile
+	 * @return bool
+	 *
+	 */
+	public function useImages(Pagefile $pagefile) {
+		return $this->accountHash && $pagefile instanceof Pageimage;
+	}
+
+	/**
+	 * Should Cloudflare Stream be used for the Pagefile?
+	 *
+	 * @param Pagefile $pagefile
+	 * @return bool
+	 *
+	 */
+	public function useStream(Pagefile $pagefile) {
+		return $this->customerSubdomain &&
+			!$this->useImages($pagefile) &&
+			in_array($pagefile->ext, explode(' ', self::streamExtensions));
+	}
+
+	/**
 	 * Download the file from R2 if it does not exist locally
 	 *
 	 * @param Pagefile $pagefile
@@ -1606,16 +1651,21 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 * Add the image to Cloudflare
 	 *
 	 * @param Pageimage $pageimage
+	 * @param $url
 	 * @return string|null
 	 *
 	 */
-	protected function addImageToCloudflare(Pageimage $pageimage) {
+	protected function addImageToCloudflare(Pageimage $pageimage, $url = '') {
+
+		if(empty($url)) {
+			$url = $pageimage->localHttpUrl;
+		}
 
 		$boundary = '--' . self::formDataBoundary;
 		$response = $this->apiRequest(
 			'images/v1',
 			"$boundary\r\n" .
-			"Content-Disposition: form-data; name=\"url\"\r\n\r\n{$pageimage->localHttpUrl}\r\n" .
+			"Content-Disposition: form-data; name=\"url\"\r\n\r\n{$url}\r\n" .
 			"$boundary--\r\n\r\n"
 		);
 
@@ -1772,29 +1822,5 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	protected function uidVariant(Pageimage $pageimage, $basename = '', $value = null) {
 		if(empty($basename)) $basename = $pageimage->basename;
 		return $pageimage->filedata("{$this->className}_{$basename}", $value);
-	}
-
-	/**
-	 * Should Cloudflare Images be used for the Pagefile?
-	 *
-	 * @param Pagefile $pagefile
-	 * @return bool
-	 *
-	 */
-	protected function useImages(Pagefile $pagefile) {
-		return $this->accountHash && $pagefile instanceof Pageimage;
-	}
-
-	/**
-	 * Should Cloudflare Stream be used for the Pagefile?
-	 *
-	 * @param Pagefile $pagefile
-	 * @return bool
-	 *
-	 */
-	protected function useStream(Pagefile $pagefile) {
-		return $this->customerSubdomain &&
-			!$this->useImages($pagefile) &&
-			in_array($pagefile->ext, explode(' ', self::streamExtensions));
 	}
 }
