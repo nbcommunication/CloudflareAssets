@@ -14,15 +14,23 @@
  * @property string $bucket
  * @property string $accessKeyId
  * @property string $secretAccessKey
+ * @property bool $disableR2
  * @property string $customerSubdomain
  * @property string $allowedOriginsList
+ * @property bool $disableStream
  * @property string $accountHash
  * @property bool $imageDelivery
+ * @property bool $disableImages
  * @property bool $onlyUploads
  *
  * @property array $allowedOrigins
+ * @property bool $runSaveHook
  * @property S3Client $s3
+ * @property array $status
  * @property array $usage
+ *
+ * @todo check that a file is fetched when requested if not on local filesystem
+ * @todo can resetUsage calls be made at the end of a page request and not on every addition?
  *
  */
 
@@ -37,7 +45,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'Cloudflare Assets',
-			'version' => 15,
+			'version' => 17,
 			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
@@ -62,12 +70,28 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	protected $allowedOrigins = [];
 
 	/**
+	 * Should the save hook keep running?
+	 *
+	 * @var bool
+	 *
+	 */
+	protected $runSaveHook = true;
+
+	/**
 	 * The AWS S3 client
 	 *
 	 * @var S3Client
 	 *
 	 */
 	protected $s3 = null;
+
+	/**
+	 * The current Cloudflare service statuses
+	 *
+	 * @var array
+	 *
+	 */
+	protected $status = [];
 
 	/**
 	 * The 'cached' usage statistics
@@ -78,18 +102,15 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	protected $usage = [];
 
 	/**
-	 * Should the save hook keep running?
-	 *
-	 * @var array
-	 *
-	 */
-	protected $runSaveHook = true;
-
-	/**
 	 * Initialize the module
 	 *
 	 */
 	public function init() {
+
+		// Get the Cloudflare service statuses
+		$this->status = $this->wire()->cache->getFor($this, 'status', 256, function() { // Check every ~4 mins
+			return $this->getServiceStatus();
+		});
 
 		// We need these details to proceed
 		if($this->accountId && $this->bucket && $this->accessKeyId && $this->secretAccessKey) {
@@ -165,11 +186,57 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			// If authenticated, attach hooks
 			if($tokenVerified) {
 
-				// If not the admin
-				if($this->wire()->page->template->name !== 'admin' && strpos($this->wire()->page->url, $this->wire()->config->urls->admin) !== 0) {
+				$messages = [];
+				foreach($this->status as $key => $status) {
 
-					// If not upload only mode
-					if(!$this->onlyUploads) {
+					if(!$this->operational($key)) {
+
+						$type = [
+							'Images' => 'images',
+							'Stream' => 'videos',
+						][$key] ?? 'files';
+
+						$message = [];
+						switch($status) {
+							case 'degraded_performance':
+								$message[] = __('degraded performance');
+								break;
+							case 'partial_outage':
+								$message[] = __('a partial outage');
+								break;
+							case 'major_outage':
+								$message[] = __('a major outage');
+								// Disable the service if not API (this is handled for API in apiRequest)
+								if($key !== 'API') {
+									$this->{"disable$key"} = 1;
+									$this->hasMajorOutage($key); // Trigger any hooks
+									$message[] = sprintf(
+										__('The service has been disabled so %s are being served from the filesystem.'),
+										$type
+									);
+								}
+								break;
+						}
+
+						$c = count($message);
+						if($c) {
+							$message[0] = sprintf(__('Cloudflare %1$s is experiencing %2$s.'), $key, $message[0]);
+							if($key === 'API') {
+								$message[] = __('Uploading files/images/videos may be affected.');
+							} else if($c === 1) {
+								$message[] = sprintf(__('Serving %s may be affected.'), $type);
+							}
+							$messages[] = $message;
+						}
+					}
+				}
+
+				// If not the admin
+				if($this->wire()->page->template->name !== 'admin' &&
+					strpos($this->wire()->page->url, $this->wire()->config->urls->admin) !== 0) {
+
+					// If not upload only mode and Images not disabled
+					if(!$this->disableImages && !$this->onlyUploads) {
 						// Check for variations that need to be removed
 						$cacheName = 'removeVariations';
 						$toRemove = $cache->getFor($this, $cacheName) ?? [];
@@ -188,12 +255,19 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 					$this->addHook('Pagefile::url()', $this, 'hookPagefileUrl');
 					$this->addHook('Pagefile::httpUrl()', $this, 'hookPagefileHttpUrl');
 
-					// After a variation is created +CloudFlare
+					// After a variation is created add to CloudFlare
 					// This is not required for the admin side as it does not serve Cloudflare URLs
 					$this->addHook('Pageimage::createdVariation', $this, 'hookPageimageCreatedVariation');
 
 					// When rendering the page, look for local links that should be replaced with Cloudflare links
 					$this->addHookAfter('Page::render', $this, 'hookPageRender', ['priority' => 199]);
+
+				} else if(count($messages) && $this->wire()->user->isLoggedin()) {
+
+					// Notify the CMS admin if there are any issues with Cloudflare Services
+					foreach($messages as $message) {
+						$this->error(implode(' ', $message));
+					}
 				}
 
 				// Utility properties
@@ -202,7 +276,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				$this->addHookProperty('Pagefile::r2Key', $this, 'hookPagefileR2Key');
 				$this->addHookProperty('Pagefile::r2Path', $this, 'hookPagefileR2Path');
 
-				// When a file is uploaded +CloudFlare
+				// When a file is uploaded add to CloudFlare
 				$this->addHookAfter('PagefilesManager::save', $this, 'hookPagefilesManagerSave');
 
 				// When a page is finished being saved, set the runSaveHook property to false
@@ -213,13 +287,13 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				// When a file input is rendered, check file availability
 				$this->addHookBefore('InputfieldFile::render', $this, 'hookInputfieldFileRender');
 
-				// When a page is deleted remove all Cloudflare assets
+				// When a page is cloned copy all Cloudflare assets
 				$this->addHookBefore('Pages::cloned', $this, 'hookPagesCloned');
 
 				// When a page is deleted remove all Cloudflare assets
 				$this->addHookBefore('Pages::delete', $this, 'hookPagesDelete');
 
-				// When a file is removed, -Cloudflare
+				// When a file is removed, remove from Cloudflare
 				$this->addHookAfter('Pagefiles::delete', $this, 'hookPagefilesDelete');
 			}
 		}
@@ -237,12 +311,22 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 */
 	public function apiRequest($endpoint = '', $data = [], $method = 'POST', $logErrors = true) {
 
+		if($this->hasMajorOutage('API')) {
+			return [];
+		}
+
 		$profiler = $this->profilerStart('apiRequest');
 
 		$http = $this->wire(new WireHttp());
 
 		if($endpoint) {
-			$endpoint = "accounts/{$this->accountId}/$endpoint";
+			// stream images
+			$endpoint = in_array(substr($endpoint, 0, 6), [
+				'images',
+				'stream',
+			]) ?
+				"accounts/{$this->accountId}/$endpoint" :
+				$endpoint;
 		} else {
 			$endpoint = 'user/tokens/verify';
 			$method = 'GET';
@@ -279,6 +363,51 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
+	 * Get the status of the Cloudflare Services
+	 *
+	 * @return array
+	 *
+	 */
+	public function getServiceStatus() {
+
+		$ids = [
+			'g4tb35rs9yw7', // API
+			'hb7g5sq2zz0h', // R2
+			'3lbj8lp3d750', // Images
+			'47xg28c02lnk', // Stream
+		];
+
+		$status = [];
+		foreach((new WireHttp)->getJSON("https://www.cloudflarestatus.com/api/v2/components.json")['components'] ?? [] as $component) {
+			if(in_array($component['id'], $ids)) {
+				$status[$component['name']] = $component['status'];
+			}
+		}
+
+		return $status;
+	}
+
+	/**
+	 * Is the Cloudflare service not operational?
+	 *
+	 * @return bool
+	 *
+	 */
+	public function ___hasMajorOutage($key) {
+		return $this->getStatus($key) === 'major_outage';
+	}
+
+	/**
+	 * Can assets be uploaded to Cloudflare?
+	 *
+	 * @return bool
+	 *
+	 */
+	public function uploadOperational() {
+		return $this->operational('API') && $this->operational('R2');
+	}
+
+	/**
 	 * Hook Pageimage::size()
 	 *
 	 * Skip variation creation if we have the variant in Cloudflare
@@ -294,7 +423,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		$height = (int) $event->arguments(1);
 		$options = $event->arguments(2);
 
-		if($this->uid($pageimage) && ($options['cfImageVariant'] ?? false)) {
+		if(!$this->disableImages && !$this->onlyUploads && $this->uid($pageimage) && ($options['cfImageVariant'] ?? false)) {
 
 			// A Cloudflare variant is requested
 
@@ -364,7 +493,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 						// We need to add the variant to the filedata of the original
 						// and to the clone so it is available immediately
 						$pageimageNew = $this->setFiledataImmediately($pageimageNew, self::imageVariantPrefix . $cfVariant);
-						$this->resetUsage('images');
+						//$this->resetUsage('images');
 					}
 
 					// Skip the variation creation
@@ -408,31 +537,35 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			$uid = $this->uid($pagefile);
 			if($uid && !$this->getLocal) {
 
-				$url = $this->getCloudflareUrl();
+				$url = '';
+				$baseUrl = $this->getCloudflareUrl();
 				if($this->useImages($pagefile)) {
 
 					$variant = '';
-					if(!$pagefile->original || $pagefile === $pagefile->original) {
-						$variant = 'public';
-					} else {
-						$v = $this->uidVariant($pagefile);
-						if($v) {
-							$variant = $v;
-							if($this->isImageVariant($variant)) {
-								$variant = $this->getImageVariantName($variant);
-							} else {
-								// The variant was uploaded directly
-								$uid = $variant;
-								$variant = 'public';
-							}
+					if(!$this->disableImages) {
+
+						if(!$pagefile->original || $pagefile === $pagefile->original) {
+							$variant = 'public';
 						} else {
-							// The Cloudflare variant does not exist or is not stored for this image
-							// We will remove the variation image so that it is regenerated next time
-							$cache = $this->wire()->cache;
-							$cacheName = 'removeVariations';
-							$toRemove = $cache->getFor($this, $cacheName) ?? [];
-							$toRemove[$pagefile->basename] = $pagefile->filename;
-							$cache->saveFor($this, $cacheName, $toRemove);
+							$v = $this->uidVariant($pagefile);
+							if($v) {
+								$variant = $v;
+								if($this->isImageVariant($variant)) {
+									$variant = $this->getImageVariantName($variant);
+								} else {
+									// The variant was uploaded directly
+									$uid = $variant;
+									$variant = 'public';
+								}
+							} else {
+								// The Cloudflare variant does not exist or is not stored for this image
+								// We will remove the variation image so that it is regenerated next time
+								$cache = $this->wire()->cache;
+								$cacheName = 'removeVariations';
+								$toRemove = $cache->getFor($this, $cacheName) ?? [];
+								$toRemove[$pagefile->basename] = $pagefile->filename;
+								$cache->saveFor($this, $cacheName, $toRemove);
+							}
 						}
 					}
 
@@ -441,33 +574,33 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 						if($this->imageDelivery) {
 							$url = "https://imagedelivery.net/$image";
 						} else {
-							$url .= "/cdn-cgi/imagedelivery/$image";
+							$url = "$baseUrl/cdn-cgi/imagedelivery/$image";
 						}
-					} else {
-						$url = ''; // Use the local URL
 					}
 
 				} else if($this->useStream($pagefile)) {
 
-					// Get/set the video dimensions if they are not already set
-					$filedata = $pagefile->filedata();
-					$width = $filedata['width'] ?? -1;
-					$height = $filedata['height'] ?? -1;
-					if($width < 0 || $height < 0) {
-						$response = $this->apiRequest("stream/$uid", [], 'GET');
-						$pagefile->page->of(false);
-						foreach($response['result']['input'] ?? [] as $key => $value) {
-							$pagefile->filedata($key, $value);
+					if(!$this->disableStream) {
+
+						// Get/set the video dimensions if they are not already set
+						$filedata = $pagefile->filedata();
+						$width = $filedata['width'] ?? -1;
+						$height = $filedata['height'] ?? -1;
+						if($width < 0 || $height < 0) {
+							$response = $this->apiRequest("stream/$uid", [], 'GET');
+							$pagefile->page->of(false);
+							foreach($response['result']['input'] ?? [] as $key => $value) {
+								$pagefile->filedata($key, $value);
+							}
+							$this->saveQuietly($pagefile);
 						}
-						$this->saveQuietly($pagefile);
+
+						$url = "https://{$this->customerSubdomain}/$uid/iframe";
 					}
 
-					$url = "https://{$this->customerSubdomain}/$uid/iframe";
+				} else if(!$this->disableR2) {
 
-
-				} else {
-
-					$url .= "/$uid";
+					$url = "$baseUrl/$uid";
 				}
 
 				if($url) {
@@ -597,7 +730,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 						foreach($value as $pagefile) {
 
 							$uid = $this->uid($pagefile);
-							if($uid && $this->useStream($pagefile)) {
+							if($uid && $this->operational('API') && $this->useStream($pagefile)) {
 
 								// If a video file which already exists
 								// Check if we need to update the name from the description
@@ -674,7 +807,11 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 */
 	public function hookInputfieldFileRender(HookEvent $event) {
 
-		if($event->object->value instanceof Pagefiles && $event->object->value->count) {
+		if(
+			$this->uploadOperational() &&
+			$event->object->value instanceof Pagefiles &&
+			$event->object->value->count
+		) {
 
 			foreach($event->object->value as $pagefile) {
 
@@ -709,9 +846,13 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 *
 	 */
 	public function hookPagesCloned(HookEvent $event) {
+
 		foreach($event->arguments('copy')->getFields() as $field) {
+
 			if($field->type instanceof FieldtypeFile) {
+
 				foreach($event->arguments('page')->get($field->name) as $pagefile) {
+
 					// Remove the existing key from the filedata
 					// Add the assets to Cloudflare and save the filedata
 					$pagefile->page->of(false);
@@ -771,7 +912,13 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		$pageimage = $event->arguments(0);
 		$data = $event->arguments(1);
 
-		if($this->useImages($pageimage) && $this->uid($pageimage) && !$this->uidVariant($pageimage)) {
+		if(
+			$this->operational('API') &&
+			!$this->disableImages &&
+			$this->useImages($pageimage) &&
+			$this->uid($pageimage) &&
+			!$this->uidVariant($pageimage)
+		) {
 
 			$profiler = $this->profilerStart('createdVariation');
 
@@ -862,7 +1009,9 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			} else {
 
 				// Upload as a new image
-				$uid = $this->addImageToCloudflare($pageimage);
+				// First add to R2 so we can add it from there
+				file_put_contents($pageimage->r2Path, fopen($pageimage->filename, 'r'));
+				$uid = $this->addImageToCloudflare($pageimage, $this->getCloudflareUrl() . "/$pageimage->r2Key");
 				if($uid) {
 					$uidVariant = $uid;
 				} else {
@@ -874,7 +1023,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				// We need to add the variant to the filedata of the original
 				// and to the clone so it is available immediately
 				$pageimage = $this->setFiledataImmediately($pageimage, $uidVariant);
-				$this->resetUsage('images');
+				//$this->resetUsage('images');
 			}
 
 			$this->profilerStop($profiler);
@@ -892,7 +1041,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 		$uid = $this->uid($pagefile);
 
-		if(!$uid) {
+		if(!$uid && $this->uploadOperational()) {
 
 			$r2Url = $this->getCloudflareUrl() . "/$pagefile->r2Key";
 
@@ -908,9 +1057,9 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 					// Add the image to Cloudflare Images
 					$uid = $this->addImageToCloudflare($pagefile, $r2Url);
 
-					if($uid) { // reset usage statistics
+					/*if($uid) { // reset usage statistics
 						$this->resetUsage('images');
-					}
+					}*/
 
 				} else if($this->useStream($pagefile)) {
 
@@ -928,9 +1077,9 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 					$uid = $response['result']['uid'] ?? null;
 
-					if($uid) { // reset usage statistics
+					/*if($uid) { // reset usage statistics
 						$this->resetUsage('stream');
-					}
+					}*/
 				}
 			}
 
@@ -960,7 +1109,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		if($isHTML) $isHTML = stripos($event->return, '</html>') !== false;
 		$out = $event->return;
 
-		if($isHTML) {
+		if($isHTML && !$this->onlyUploads) {
 
 			$urlFiles = $this->wire()->config->urls('files');
 
@@ -1028,8 +1177,10 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 									'hidpi' => strpos($dimensions[3] ?? '', 'hidpi') !== false,
 								]);
 							}
-							$replacements[$matchUrl] = $pagefile->url;
-						} else {
+							if(!$this->disableImages) {
+								$replacements[$matchUrl] = $pagefile->url;
+							}
+						} else if(!$this->disableR2) {
 							$replacements[$matchUrl] = $pagefile->url;
 						}
 					}
@@ -1391,16 +1542,19 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			$query->execute();
 			$records = $variants ? [] : [[], []];
 			foreach($query->fetchAll(\PDO::FETCH_ASSOC) as $row) {
-				foreach(json_decode($row['filedata'], 1) as $key => $value) {
-					if(strpos($key, $this->className) === 0) {
-						if($variants) {
-							if($this->isImageVariant($value)) {
-								$records[] = $this->getImageVariantName($value);
-							} else if($key === $this->className) {
-								$records[] = 'public';
+				$filedata = json_decode($row['filedata'], 1);
+				if($filedata) {
+					foreach($filedata as $key => $value) {
+						if(strpos($key, $this->className) === 0) {
+							if($variants) {
+								if($this->isImageVariant($value)) {
+									$records[] = $this->getImageVariantName($value);
+								} else if($key === $this->className) {
+									$records[] = 'public';
+								}
+							} else {
+								$records[$key === $this->className ? 0 : 1][] = $value;
 							}
-						} else {
-							$records[$key === $this->className ? 0 : 1][] = $value;
 						}
 					}
 				}
@@ -1408,7 +1562,8 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			return $records;
 		};
 
-		$images = $cache->getFor($this, 'usageImages', WireCache::expireNever, function() use ($_getRecords) {
+		$images = [];
+		/*$images = $cache->getFor($this, 'usageImages', WireCache::expireNever, function() use ($_getRecords) {
 
 			$counts = $this->apiRequest('images/v1/stats', [], 'GET', false)['result']['count'] ?? [];
 
@@ -1438,7 +1593,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			$counts['local'] = count($items) + $counts['missed'];
 
 			return $counts;
-		});
+		});*/
 
 		$variants = $cache->getFor($this, 'usageVariants', WireCache::expireNever, function() use ($_getRecords) {
 
@@ -1464,7 +1619,8 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			];
 		});
 
-		$stream = $cache->getFor($this, 'usageStream', WireCache::expireNever, function() use ($_getRecords) {
+		$stream = [];
+		/*$stream = $cache->getFor($this, 'usageStream', WireCache::expireNever, function() use ($_getRecords) {
 
 			$counts = [];
 			$result = $this->apiRequest('stream', [], 'GET', false);
@@ -1494,7 +1650,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			$counts['local'] = count($items) + $counts['missed'];
 
 			return $counts;
-		});
+		});*/
 
 		$this->usage = [
 			'imagesAllowed' => $images['allowed'] ?? 0,
@@ -1555,7 +1711,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public function removeFromCloudflare(Pagefile $pagefile) {
 
 		$uid = $this->uid($pagefile);
-		if($uid) {
+		if($uid && $this->uploadOperational()) {
 
 			$useImages = $this->useImages($pagefile);
 
@@ -1588,7 +1744,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			unlink($pagefile->r2Path);
 
 			// Update statistics
-			$this->resetUsage($endpoint);
+			//$this->resetUsage($endpoint);
 		}
 
 		// Remove filedata
@@ -1640,7 +1796,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		$remoteFile = $pagefile->r2Path;
 
 		$downloaded = false;
-		if(!file_exists($localFile) && file_exists($remoteFile)) {
+		if(!$this->hasMajorOutage('R2') && !file_exists($localFile) && file_exists($remoteFile)) {
 			$downloaded = $this->wire()->files->filePutContents($localFile, fopen($remoteFile, 'r'));
 		}
 
@@ -1686,6 +1842,21 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
+	 * Get the status of a Cloudflare service
+	 *
+	 * If the status is not set, assume operational
+	 * This means that an issue with the status API would not
+	 * impact the functionality of this module
+	 *
+	 * @param string $key
+	 * @return string
+	 *
+	 */
+	protected function getStatus($key) {
+		return $this->status[$key] ?? 'operational';
+	}
+
+	/**
 	 * Is this variant name an image variant?
 	 *
 	 * @param string $variant
@@ -1694,6 +1865,17 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 */
 	protected function isImageVariant($variant) {
 		return substr($variant, 0, strlen(self::imageVariantPrefix)) === self::imageVariantPrefix;
+	}
+
+	/**
+	 * Is the Cloudflare service operational?
+	 *
+	 * @param string $key
+	 * @return bool
+	 *
+	 */
+	protected function operational($key) {
+		return $this->getStatus($key) === 'operational';
 	}
 
 	/**

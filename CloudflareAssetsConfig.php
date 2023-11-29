@@ -15,8 +15,11 @@ class CloudflareAssetsConfig extends ModuleConfig {
 	 */
 	public function getDefaults() {
 		return [
+			'disableR2' => 0,
 			'allowedOriginsList' => implode("\n", $this->wire()->config->httpHosts),
+			'disableStream' => 0,
 			'imageDelivery' => 0,
+			'disableImages' => 0,
 			'onlyUploads' => 0,
 		];
 	}
@@ -38,13 +41,26 @@ class CloudflareAssetsConfig extends ModuleConfig {
 		// Get the module this configures
 		$module = $modules->get(str_replace('Config', '', $this->className));
 
-		if($input->post->bool('_clearStats')) {
+		/*if($input->post->bool('_clearStats')) {
 			$this->wire()->cache->deleteFor($module, 'usage*');
 			$this->message($this->_('Cache cleared and usage statistics regenerated'));
 			$this->wire()->session->redirect($input->url(true));
-		}
+		}*/
 
-		$usage = $module->getUsageStatistics();
+		$_disable = function($key) {
+			$name = "disable$key";
+			return [
+				'type' => 'checkbox',
+				'name' => $name,
+				'value' => $this->$name,
+				'label' => sprintf($this->_('Disable %s?'), $key),
+				'description' => sprintf($this->_('If this is enabled, assets served from the %s service will be served from the local filesystem instead.'), $key),
+				'icon' => 'ban',
+				'collapsed' => 2,
+			];
+		};
+
+		//$usage = $module->getUsageStatistics();
 
 		$inputfields->add([
 			'type' => 'text',
@@ -118,9 +134,11 @@ class CloudflareAssetsConfig extends ModuleConfig {
 			'columnWidth' => 50,
 		]);
 
+		$fieldset->add($_disable('R2'));
+
 		$inputfields->add($fieldset);
 
-		$_getNotes = function($key) use ($usage) {
+		/*$_getNotes = function($key) use ($usage) {
 
 			$notes = [
 				sprintf(
@@ -153,12 +171,12 @@ class CloudflareAssetsConfig extends ModuleConfig {
 			}
 
 			return implode("\n", $notes);
-		};
+		};*/
 
 		$fieldset = $modules->get('InputfieldFieldset');
 		$fieldset->label = $this->_('Stream');
 		$fieldset->icon = 'play-circle';
-		$fieldset->description = sprintf(
+		/*$fieldset->description = sprintf(
 			$this->_n(
 				$this->_('Cloudflare Stream contains **%s** video.'),
 				$this->_('Cloudflare Stream contains **%s** videos.'),
@@ -166,7 +184,7 @@ class CloudflareAssetsConfig extends ModuleConfig {
 			),
 			number_format($usage['streamCount'])
 		);
-		$fieldset->notes = $_getNotes('stream');
+		$fieldset->notes = $_getNotes('stream');*/
 
 		$fieldset->add([
 			'type' => 'text',
@@ -189,12 +207,14 @@ class CloudflareAssetsConfig extends ModuleConfig {
 			'icon' => 'globe',
 		]);
 
+		$fieldset->add($_disable('Stream'));
+
 		$inputfields->add($fieldset);
 
 		$fieldset = $modules->get('InputfieldFieldset');
 		$fieldset->label = $this->_('Images');
 		$fieldset->icon = 'picture-o';
-		$fieldset->description = sprintf(
+		/*$fieldset->description = sprintf(
 			$this->_('You are currently using **%1$s** of **%2$s** images, and **%3$s** of **%4$s** image variants.'),
 			number_format($usage['imagesCount']),
 			number_format($usage['imagesAllowed']),
@@ -202,7 +222,7 @@ class CloudflareAssetsConfig extends ModuleConfig {
 			number_format($usage['variantsAllowed'])
 		);
 
-		$fieldset->notes = $_getNotes('images');
+		$fieldset->notes = $_getNotes('images');*/
 
 		$fieldset->add([
 			'type' => 'text',
@@ -224,7 +244,7 @@ class CloudflareAssetsConfig extends ModuleConfig {
 			'collapsed' => 2,
 		]);
 
-		$variantsCount = $usage['variantsCount'];
+		/*$variantsCount = $usage['variantsCount'];
 		if($variantsCount) {
 
 			$icon = 'star';
@@ -288,11 +308,13 @@ class CloudflareAssetsConfig extends ModuleConfig {
 				'icon' => $icon,
 				'collapsed' => 1,
 			]);
-		}
+		}*/
+
+		$fieldset->add($_disable('Images'));
 
 		$inputfields->add($fieldset);
 
-		$inputfields->add([
+		/*$inputfields->add([
 			'type' => 'checkbox',
 			'name' => '_clearStats',
 			'value' => 0,
@@ -301,7 +323,7 @@ class CloudflareAssetsConfig extends ModuleConfig {
 			'description' => $this->_('If you have deleted assets in the Cloudflare admin, check this box and click Submit to regenerate usage stats.'),
 			'icon' => 'refresh',
 			'collapsed' => 2,
-		]);
+		]);*/
 
 		$inputfields->add([
 			'type' => 'checkbox',
