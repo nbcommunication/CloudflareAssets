@@ -45,7 +45,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'Cloudflare Assets',
-			'version' => 17,
+			'version' => 20,
 			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
@@ -112,40 +112,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			return $this->getServiceStatus();
 		});
 
-		// We need these details to proceed
-		if($this->accountId && $this->bucket && $this->accessKeyId && $this->secretAccessKey) {
-
-			require_once __DIR__ . '/vendor/autoload.php';
-
-			try {
-
-				// Create the client
-				$this->s3 = new \Aws\S3\S3Client([
-					'region' => 'auto',
-					'endpoint' => "https://{$this->accountId}.r2.cloudflarestorage.com",
-					'version' => 'latest',
-					'credentials' => new \Aws\Credentials\Credentials($this->accessKeyId, $this->secretAccessKey),
-				]);
-
-				// Use the stream wrapper (native PHP functions)
-				$this->s3->registerStreamWrapperV2();
-
-				// If the bucket does not exist, create it
-				if(!$this->s3->doesBucketExistV2($this->bucket)) {
-					$this->s3->createBucket([
-						'Bucket' => $this->bucket,
-					]);
-				}
-
-			} catch(\Aws\S3\Exception\S3Exception $e) {
-
-				$this->log($e->getMessage());
-
-			} catch(\Aws\Exception\AwsException $e) {
-
-				$this->log($e->getMessage());
-			}
-		}
+		require_once __DIR__ . '/vendor/autoload.php';
 
 		// Set the allowed origins for streams
 		$this->allowedOriginsList = trim($this->allowedOriginsList);
@@ -162,8 +129,8 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 */
 	public function ready() {
 
-		// If authenticated with R2 and we have an API access token
-		if($this->s3 && $this->accessToken) {
+		// If we have an API access token
+		if($this->accessToken) {
 
 			$cache = $this->wire()->cache;
 
@@ -262,7 +229,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 					// When rendering the page, look for local links that should be replaced with Cloudflare links
 					$this->addHookAfter('Page::render', $this, 'hookPageRender', ['priority' => 199]);
 
-				} else if(count($messages) && $this->wire()->user->isLoggedin()) {
+				} else if(count($messages) && $this->wire()->user->isLoggedin() && !$this->wire()->config->ajax) {
 
 					// Notify the CMS admin if there are any issues with Cloudflare Services
 					foreach($messages as $message) {
@@ -398,13 +365,60 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
+	 * Return the S3 client for working with R2
+	 *
+	 * @return S3Client
+	 *
+	 */
+	public function s3Client() {
+
+		if(is_null($this->s3)) {
+
+			// We need these details to proceed
+			if($this->accountId && $this->bucket && $this->accessKeyId && $this->secretAccessKey) {
+
+				try {
+
+					// Create the client
+					$this->s3 = new \Aws\S3\S3Client([
+						'region' => 'auto',
+						'endpoint' => "https://{$this->accountId}.r2.cloudflarestorage.com",
+						'version' => 'latest',
+						'credentials' => new \Aws\Credentials\Credentials($this->accessKeyId, $this->secretAccessKey),
+					]);
+
+					// Use the stream wrapper (native PHP functions)
+					$this->s3->registerStreamWrapperV2();
+
+					// If the bucket does not exist, create it
+					if(!$this->s3->doesBucketExistV2($this->bucket)) {
+						$this->s3->createBucket([
+							'Bucket' => $this->bucket,
+						]);
+					}
+
+				} catch(\Aws\S3\Exception\S3Exception $e) {
+
+					$this->log($e->getMessage());
+
+				} catch(\Aws\Exception\AwsException $e) {
+
+					$this->log($e->getMessage());
+				}
+			}
+		}
+
+		return $this->s3;
+	}
+
+	/**
 	 * Can assets be uploaded to Cloudflare?
 	 *
 	 * @return bool
 	 *
 	 */
 	public function uploadOperational() {
-		return $this->operational('API') && $this->operational('R2');
+		return !$this->hasMajorOutage('API') && !$this->hasMajorOutage('R2');
 	}
 
 	/**
@@ -730,7 +744,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 						foreach($value as $pagefile) {
 
 							$uid = $this->uid($pagefile);
-							if($uid && $this->operational('API') && $this->useStream($pagefile)) {
+							if($uid && !$this->hasMajorOutage('API') && $this->useStream($pagefile)) {
 
 								// If a video file which already exists
 								// Check if we need to update the name from the description
@@ -810,7 +824,8 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		if(
 			$this->uploadOperational() &&
 			$event->object->value instanceof Pagefiles &&
-			$event->object->value->count
+			$event->object->value->count &&
+			$this->s3Client()
 		) {
 
 			foreach($event->object->value as $pagefile) {
@@ -913,7 +928,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		$data = $event->arguments(1);
 
 		if(
-			$this->operational('API') &&
+			!$this->hasMajorOutage('API') &&
 			!$this->disableImages &&
 			$this->useImages($pageimage) &&
 			$this->uid($pageimage) &&
@@ -1006,7 +1021,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				// Log the expected result
 				$this->log(sprintf($this->_('Dry run: an image variation would be uploaded with the filedata key `%s`'), "$dryRun: {CFUID}"));
 
-			} else {
+			} else if($this->s3Client()) {
 
 				// Upload as a new image
 				// First add to R2 so we can add it from there
@@ -1041,7 +1056,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 		$uid = $this->uid($pagefile);
 
-		if(!$uid && $this->uploadOperational()) {
+		if(!$uid && $this->uploadOperational() && $this->s3Client()) {
 
 			$r2Url = $this->getCloudflareUrl() . "/$pagefile->r2Key";
 
@@ -1526,6 +1541,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 * Get the usage statistics
 	 *
 	 * @return array
+	 * @todo need to figure out a better way to get/store the usage stats
 	 *
 	 */
 	public function getUsageStatistics() {
@@ -1663,7 +1679,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			'variantsUsage' => $variants['usage'] ?? [],
 			'variantsAllowed' => self::maxVariants,
 			'variantsCount' => count($variants['variants'] ?? []),
-			'streamCount' => $stream['current'],
+			'streamCount' => $stream['current'] ?? 0,
 			'streamLocal' => $stream['local'] ?? 0,
 			'streamDuplicate' => $stream['duplicate'] ?? 0,
 			'streamMissed' => $stream['missed'] ?? 0,
@@ -1711,7 +1727,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public function removeFromCloudflare(Pagefile $pagefile) {
 
 		$uid = $this->uid($pagefile);
-		if($uid && $this->uploadOperational()) {
+		if($uid && $this->uploadOperational() && $this->s3Client()) {
 
 			$useImages = $this->useImages($pagefile);
 
@@ -1796,7 +1812,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 		$remoteFile = $pagefile->r2Path;
 
 		$downloaded = false;
-		if(!$this->hasMajorOutage('R2') && !file_exists($localFile) && file_exists($remoteFile)) {
+		if(!$this->hasMajorOutage('R2') && $this->s3Client() && !file_exists($localFile) && file_exists($remoteFile)) {
 			$downloaded = $this->wire()->files->filePutContents($localFile, fopen($remoteFile, 'r'));
 		}
 
