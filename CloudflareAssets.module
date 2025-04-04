@@ -233,7 +233,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 					// Notify the CMS admin if there are any issues with Cloudflare Services
 					foreach($messages as $message) {
-						$this->error(implode(' ', $message));
+						$this->warning(implode(' ', $message));
 					}
 				}
 
