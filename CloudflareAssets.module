@@ -5,7 +5,7 @@
  *
  * #pw-summary Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.
  *
- * @copyright 2023 NB Communication Ltd
+ * @copyright 2025 NB Communication Ltd
  * @license Mozilla Public License v2.0 http://mozilla.org/MPL/2.0/
  *
  * @property string $accountId
@@ -27,10 +27,8 @@
  * @property bool $runSaveHook
  * @property S3Client $s3
  * @property array $status
- * @property array $usage
  *
  * @todo check that a file is fetched when requested if not on local filesystem
- * @todo can resetUsage calls be made at the end of a page request and not on every addition?
  *
  */
 
@@ -45,7 +43,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'Cloudflare Assets',
-			'version' => 20,
+			'version' => '0.3.0',
 			'summary' => 'Extends Pagefile to use Cloudflare Images, Stream and R2 storage to serve files.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/CloudflareAssets',
@@ -92,14 +90,6 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	 *
 	 */
 	protected $status = [];
-
-	/**
-	 * The 'cached' usage statistics
-	 *
-	 * @var array
-	 *
-	 */
-	protected $usage = [];
 
 	/**
 	 * Initialize the module
@@ -444,7 +434,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			$cfVariant = $this->getCloudflareVariant($width, $height, $options)['name'] ?? '';
 			if($cfVariant) {
 
-				$variants = $this->getUsageStatistics()['variants'] ?? [];
+				$variants = $this->variantsUsed();
 				if(count($variants) && in_array($cfVariant, $variants)) {
 
 					// If the variant name is in the list of variants
@@ -507,7 +497,6 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 						// We need to add the variant to the filedata of the original
 						// and to the clone so it is available immediately
 						$pageimageNew = $this->setFiledataImmediately($pageimageNew, self::imageVariantPrefix . $cfVariant);
-						//$this->resetUsage('images');
 					}
 
 					// Skip the variation creation
@@ -960,11 +949,11 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				$uidVariant = self::imageVariantPrefix . $cfVariant;
 
 				// Get the variant usage
-				$usage = $this->getUsageStatistics();
+				$variants = $this->variantsUsed();
 
 				// If the number of variants is approaching the maximum (4/5 used), notify the admin
 				$maxVariants = self::maxVariants;
-				$numVariants = $usage['variantsCount'];
+				$numVariants = count($variants);
 				if($numVariants / $maxVariants > 0.8) {
 
 					$cache->getFor($this, 'totalVariantsNotifyAdmin', 'daily', function() use ($config, $maxVariants, $numVariants) {
@@ -995,14 +984,14 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 					// Log the expected result
 
-					if(!in_array($cfVariant, $usage['variants'])) {
+					if(!in_array($cfVariant, $variants)) {
 						$this->log(sprintf($this->_('Dry run: the image would create a Cloudflare Images Variant named `%s`'), $cfVariant));
 					}
 
 					$this->log(sprintf($this->_('Dry run: the image would use a Cloudflare Images Variant named `%1$s` with the filedata key `%2$s`'), $cfVariant, "$dryRun: $uidVariant"));
 					$uidVariant = null;
 
-				} else if(!in_array($cfVariant, $usage['variants'])) {
+				} else if(!in_array($cfVariant, $variants)) {
 
 					// If the variant does not exist
 					// Create the variant
@@ -1013,7 +1002,9 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 							'options' => $cfVariantOptions,
 						],
 					);
-					$this->resetUsage('variants');
+
+					// Add to the list
+					$this->variantsUsed($cfVariant);
 				}
 
 			} else if($dryRun) {
@@ -1038,7 +1029,6 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				// We need to add the variant to the filedata of the original
 				// and to the clone so it is available immediately
 				$pageimage = $this->setFiledataImmediately($pageimage, $uidVariant);
-				//$this->resetUsage('images');
 			}
 
 			$this->profilerStop($profiler);
@@ -1061,7 +1051,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			$r2Url = $this->getCloudflareUrl() . "/$pagefile->r2Key";
 
 			// All uploaded files are placed in R2 via s3 client
-			if(file_put_contents($pagefile->r2Path, fopen($pagefile->filename, 'r'))) {
+			if(file_exists($pagefile->filename) && file_put_contents($pagefile->r2Path, fopen($pagefile->filename, 'r'))) {
 				$uid = $pagefile->r2Key;
 			}
 
@@ -1070,11 +1060,7 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 				if($this->useImages($pagefile)) {
 
 					// Add the image to Cloudflare Images
-					$uid = $this->addImageToCloudflare($pagefile, $r2Url);
-
-					/*if($uid) { // reset usage statistics
-						$this->resetUsage('images');
-					}*/
+					$uid = $this->addImageToCloudflare($pagefile, "$r2Url?nc=" . time());
 
 				} else if($this->useStream($pagefile)) {
 
@@ -1091,10 +1077,6 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 					);
 
 					$uid = $response['result']['uid'] ?? null;
-
-					/*if($uid) { // reset usage statistics
-						$this->resetUsage('stream');
-					}*/
 				}
 			}
 
@@ -1538,157 +1520,6 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
-	 * Get the usage statistics
-	 *
-	 * @return array
-	 * @todo need to figure out a better way to get/store the usage stats
-	 *
-	 */
-	public function getUsageStatistics() {
-
-		if(count($this->usage)) {
-			return $this->usage;
-		}
-
-		$cache = $this->wire()->cache;
-
-		$_getRecords = function($name, $variants = false) {
-			$table = strtolower("field_$name");
-			$query = $this->wire()->database->prepare("SELECT filedata FROM $table");
-			$query->execute();
-			$records = $variants ? [] : [[], []];
-			foreach($query->fetchAll(\PDO::FETCH_ASSOC) as $row) {
-				$filedata = json_decode($row['filedata'], 1);
-				if($filedata) {
-					foreach($filedata as $key => $value) {
-						if(strpos($key, $this->className) === 0) {
-							if($variants) {
-								if($this->isImageVariant($value)) {
-									$records[] = $this->getImageVariantName($value);
-								} else if($key === $this->className) {
-									$records[] = 'public';
-								}
-							} else {
-								$records[$key === $this->className ? 0 : 1][] = $value;
-							}
-						}
-					}
-				}
-			}
-			return $records;
-		};
-
-		$images = [];
-		/*$images = $cache->getFor($this, 'usageImages', WireCache::expireNever, function() use ($_getRecords) {
-
-			$counts = $this->apiRequest('images/v1/stats', [], 'GET', false)['result']['count'] ?? [];
-
-			$items = [];
-			$counts['missed'] = 0;
-			$counts['duplicate'] = 0;
-			$counts['variations'] = 0;
-			foreach($this->wire()->fields->findByType('FieldtypeImage', ['valueType' => 'name', 'indexType' => '']) as $name) {
-				$records = $_getRecords($name);
-				foreach($records[0] as $uid) {
-					if($uid) {
-						if(isset($items[$uid])) {
-							$counts['duplicate']++;
-						}
-						$items[$uid] = $uid;
-					} else {
-						$counts['missed']++;
-					}
-				}
-				foreach($records[1] as $uid) {
-					if(!$this->isImageVariant($uid)) {
-						$counts['variations']++;
-					}
-				}
-			}
-
-			$counts['local'] = count($items) + $counts['missed'];
-
-			return $counts;
-		});*/
-
-		$variants = $cache->getFor($this, 'usageVariants', WireCache::expireNever, function() use ($_getRecords) {
-
-			$variants = [];
-			foreach(array_keys($this->apiRequest('images/v1/variants', [], 'GET', false)['result']['variants'] ?? []) as $variant) {
-				$variants[$variant] = [];
-			}
-
-			$existingVariants = array_keys($variants);
-
-			foreach($this->wire()->fields->findByType('FieldtypeImage', ['valueType' => 'name', 'indexType' => '']) as $name) {
-				foreach($_getRecords($name, true) as $variant) {
-					if(!isset($variants[$variant][$name])) {
-						$variants[$variant][$name] = 0;
-					}
-					$variants[$variant][$name]++;
-				}
-			}
-
-			return [
-				'variants' => $existingVariants,
-				'usage' => $variants,
-			];
-		});
-
-		$stream = [];
-		/*$stream = $cache->getFor($this, 'usageStream', WireCache::expireNever, function() use ($_getRecords) {
-
-			$counts = [];
-			$result = $this->apiRequest('stream', [], 'GET', false);
-			$counts['current'] = $result['result_info']['total_count'] ?? count($result['result'] ?? []);
-
-			$items = [];
-			$counts['missed'] = 0;
-			$counts['duplicate'] = 0;
-			foreach($this->wire()->fields->findByType('FieldtypeFile', ['valueType' => 'name', 'indexType' => '']) as $name) {
-				foreach(explode(' ', $this->wire()->fields->get($name)->extensions) as $ext) {
-					if(in_array($ext, explode(' ', self::streamExtensions))) {
-						$records = $_getRecords($name);
-						foreach($records[0] as $uid) {
-							if($uid) {
-								if(isset($items[$uid])) {
-									$counts['duplicate']++;
-								}
-								$items[$uid] = $uid;
-							} else {
-								$counts['missed']++;
-							}
-						}
-					}
-				}
-			}
-
-			$counts['local'] = count($items) + $counts['missed'];
-
-			return $counts;
-		});*/
-
-		$this->usage = [
-			'imagesAllowed' => $images['allowed'] ?? 0,
-			'imagesCount' => $images['current'] ?? 0,
-			'imagesLocal' => $images['local'] ?? 0,
-			'imagesVariations' => $images['variations'] ?? 0,
-			'imagesDuplicate' => $images['duplicate'] ?? 0,
-			'imagesMissed' => $images['missed'] ?? 0,
-			'variants' => $variants['variants'] ?? [],
-			'variantsUsage' => $variants['usage'] ?? [],
-			'variantsAllowed' => self::maxVariants,
-			'variantsCount' => count($variants['variants'] ?? []),
-			'streamCount' => $stream['current'] ?? 0,
-			'streamLocal' => $stream['local'] ?? 0,
-			'streamDuplicate' => $stream['duplicate'] ?? 0,
-			'streamMissed' => $stream['missed'] ?? 0,
-		];
-
-		return $this->usage;
-	}
-
-	/**
 	 * Get the name (label) of this
 	 *
 	 * @param Pagefile $pagefile
@@ -1758,15 +1589,36 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 
 			// Remove the item from R2
 			unlink($pagefile->r2Path);
-
-			// Update statistics
-			//$this->resetUsage($endpoint);
 		}
 
 		// Remove filedata
 		$pagefile = $this->removeUids($pagefile);
 
 		return $uid;
+	}
+
+	/**
+	 * Get the variants used
+	 *
+	 * @param string $variant
+	 * @return array
+	 *
+	 */
+	public function variantsUsed($variant = '') {
+
+		$cache = $this->wire()->cache;
+		$cacheKey = 'variantsUsed';
+
+		$variantsUsed = $cache->getFor($this, $cacheKey) ?? [];
+
+		if($variant && !in_array($variant, $variantsUsed)) {
+			// add variant to the list
+			$variantsUsed[] = $variant;
+			sort($variantsUsed);
+			$cache->saveFor($this, $cacheKey, $variantsUsed);
+		}
+
+		return $variantsUsed;
 	}
 
 	/**
@@ -1935,20 +1787,6 @@ class CloudflareAssets extends WireData implements Module, ConfigurableModule {
 			}
 		}
 		return $pagefile;
-	}
-
-	/**
-	 * Reset usage
-	 *
-	 * @param string $key
-	 * @return int
-	 *
-	 */
-	protected function resetUsage($key) {
-		// Remove cached usage stats
-		$this->wire()->cache->deleteFor($this, 'usage' . ucfirst(explode('/', $key)[0]));
-		// Get them again
-		return $this->getUsageStatistics()["{$key}Count"] ?? 0;
 	}
 
 	/**
